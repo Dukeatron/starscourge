@@ -133,6 +133,7 @@ Paste in a new regulation and a JSON snapshot of how the company is set up today
   - **Dates set by Python:** all timestamps come from Python in UTC. The audit log is rejected if the model writes any date or time that isn't in the input.
   - **Fallback renderer:** if the model's log fails validation twice, a deterministic renderer produces a valid log anyway.
   - **Prompt-injection defense:** regulation and company text are treated as untrusted data.
+- **Local by default:** with no configuration, the engine runs on the local Ollama server. It picks the smallest installed model (found through `/api/tags`, e.g. `qwen2.5vl:3b`), so no key is needed and no data leaves the machine.
 - **Any model, your own key:** every function takes optional `api_key=`, `provider=` and `model=`.
   - Claude uses the native API.
   - Every other provider goes through one OpenAI-compatible adapter: OpenAI, Gemini, Groq, OpenRouter, DeepSeek, Mistral, xAI, Together, local Ollama, or any custom OpenAI-compatible server.
@@ -154,7 +155,7 @@ pytest -m live                        # real API: retention gap, compliant state
 
 | Env var | Default | Notes |
 | --- | --- | --- |
-| `LLM_PROVIDER` | first provider with a key set | `anthropic`, `openai`, `gemini`, `groq`, `openrouter`, `deepseek`, `mistral`, `xai`, `together`, `ollama` or `custom` |
+| `LLM_PROVIDER` | `ollama` (smallest locally installed model, no key needed) | `anthropic`, `openai`, `gemini`, `groq`, `openrouter`, `deepseek`, `mistral`, `xai`, `together`, `ollama` or `custom` |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, … | none | One per provider. Put them in a gitignored `.env` (see `.env.example`). Read at call time and never logged. |
 | `LLM_MODEL` / `<PROVIDER>_MODEL` | `claude-sonnet-5-5`, `gpt-5-mini`, `gemini-2.5-flash`, … | Override the default model. |
 | `LLM_BASE_URL`, `LLM_API_KEY` | none | For `LLM_PROVIDER=custom` (any OpenAI-compatible server). |

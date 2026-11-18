@@ -173,7 +173,7 @@ def test_missing_key_maps_to_401(monkeypatch):
     for name in ai_engine.PROVIDERS:
         for var in ai_engine._key_env_vars(name):
             monkeypatch.delenv(var, raising=False)
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
     response = client.post("/api/analyze-regulation", json={"text": REGULATION})
     assert response.status_code == 401
     assert "X-LLM-Api-Key" in response.json()["detail"]["message"]

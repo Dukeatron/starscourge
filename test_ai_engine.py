@@ -87,8 +87,9 @@ def no_key(monkeypatch):
     for name in ai_engine.PROVIDERS:
         for var in ai_engine._key_env_vars(name):
             monkeypatch.delenv(var, raising=False)
-    for var in ("LLM_PROVIDER", "LLM_MODEL", "LLM_BASE_URL"):
+    for var in ("LLM_MODEL", "LLM_BASE_URL"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")  # key-handling tests use a provider that needs one
 
 
 # --------------------------------------------------------------------------- 1. _coerce_json_object
@@ -529,6 +530,7 @@ def test_import_without_key_and_call_raises_config_error():
     key_vars = {v for p in ai_engine.PROVIDERS for v in ai_engine._key_env_vars(p)}
     env = {k: v for k, v in os.environ.items() if k not in key_vars}
     env["AI_ENGINE_DOTENV"] = "0"
+    env["LLM_PROVIDER"] = "anthropic"  # a provider that needs a key
     code = (
         "import ai_engine\n"
         "try:\n"
@@ -731,11 +733,34 @@ def test_explicit_provider_wins_over_key_prefix(no_key):
     assert ai_engine._resolve_provider("deepseek", "sk-abc") == "deepseek"
 
 
-def test_env_provider_falls_back_to_first_configured_key(no_key, monkeypatch):
+def test_default_provider_is_ollama_and_env_overrides(no_key, monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER")
     monkeypatch.setenv("GROQ_API_KEY", "gsk_x")
-    assert ai_engine._resolve_provider() == "groq"
+    assert ai_engine._resolve_provider() == "ollama"
     monkeypatch.setenv("LLM_PROVIDER", "mistral")
     assert ai_engine._resolve_provider() == "mistral"
+
+
+def test_ollama_default_model_is_smallest_installed(no_key, monkeypatch):
+    import io
+
+    tags = {"models": [
+        {"name": "big:27b", "size": 18_000_000_000},
+        {"name": "small:3b", "size": 3_200_000_000},
+        {"name": "mid:7b", "size": 4_700_000_000},
+    ]}
+    monkeypatch.setattr(ai_engine, "_ollama_default", None)
+    monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout: io.BytesIO(json.dumps(tags).encode()))
+    assert ai_engine._resolve_model("ollama") == "small:3b"
+
+
+def test_ollama_default_model_falls_back_when_server_down(no_key, monkeypatch):
+    def down(url, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(ai_engine, "_ollama_default", None)
+    monkeypatch.setattr("urllib.request.urlopen", down)
+    assert ai_engine._resolve_model("ollama") == ai_engine.OLLAMA_FALLBACK_MODEL
 
 
 def test_unknown_provider_is_value_error(provider):
