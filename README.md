@@ -140,6 +140,17 @@ Paste in a new regulation and a JSON snapshot of how the company is set up today
   - Pass only a key and the provider is detected from its prefix.
   - If a model rejects a parameter (`temperature`, `max_tokens`, strict JSON schema), the request falls back step by step. The JSON repair and schema validation still run afterwards.
 
+### Frontend
+
+Run `uvicorn main:app --reload` and open **http://127.0.0.1:8000/**. One page (`static/index.html`, no build step):
+
+1. **Company state:** the mock FintechX profile, editable as JSON.
+2. **Regulation:** paste text, or click *Load sample regulation*. Then click **Analyze gaps** (or press Cmd/Ctrl+Enter).
+3. **Findings:** counts by severity, then one colour-coded card per gap with the verbatim regulation quote, requirement, current state, gap and remediation. Gaps where the data is insufficient are marked separately.
+4. **Audit log:** **Generate audit log** renders the Markdown report, which you can download or copy.
+
+Optional provider, model and API key fields send the `X-LLM-*` headers. The key is never stored. The header dot shows whether the API is up.
+
 ### Setup and run
 
 Requires Python 3.10+.
