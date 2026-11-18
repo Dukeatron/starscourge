@@ -356,6 +356,17 @@ def _truncate(text: str, limit: int) -> str:
     return cut + "…"
 
 
+def _truncate_verbatim(text: str, limit: int) -> str:
+    """Shorten a quote by cutting it, never adding characters, so it stays verbatim."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    space = cut.rfind(" ")
+    if space > limit // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:")
+
+
 _QUOTE_MAP = str.maketrans({
     "‘": "'", "’": "'", "“": '"', "”": '"',
     "–": "-", "—": "-", " ": " ",
@@ -401,19 +412,19 @@ def _ground_excerpt(excerpt: str, regulation: str, norm_reg: str, index: list[in
     if norm_ex:
         pos = norm_reg.find(norm_ex)
         if pos != -1:
-            return _truncate(_source_slice(regulation, index, pos, len(norm_ex)).strip(), MAX_EXCERPT_CHARS)
+            return _truncate_verbatim(_source_slice(regulation, index, pos, len(norm_ex)).strip(), MAX_EXCERPT_CHARS)
         # The model sometimes joins two fragments with "..."; ground the longest fragment.
         fragments = sorted((f.strip() for f in re.split(r"\.{3}|…", norm_ex)), key=len, reverse=True)
         for frag in fragments:
             if len(frag) >= 20:
                 pos = norm_reg.find(frag)
                 if pos != -1:
-                    return _truncate(_source_slice(regulation, index, pos, len(frag)).strip(), MAX_EXCERPT_CHARS)
+                    return _truncate_verbatim(_source_slice(regulation, index, pos, len(frag)).strip(), MAX_EXCERPT_CHARS)
 
     # Not quoted verbatim: use the regulation sentence that shares the most words with it.
     sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(regulation) if len(s.strip()) >= 15]
     if not sentences:
-        return _truncate(regulation.strip(), MAX_EXCERPT_CHARS)
+        return _truncate_verbatim(regulation.strip(), MAX_EXCERPT_CHARS)
     target_words = set(_WORD_RE.findall(norm_ex))
     best, best_score = sentences[0], (-1.0, -1.0)
     for sentence in sentences:
@@ -423,7 +434,7 @@ def _ground_excerpt(excerpt: str, regulation: str, norm_reg: str, index: list[in
         score = (overlap, difflib.SequenceMatcher(None, norm_ex, norm_sentence, autojunk=False).ratio())
         if score > best_score:
             best, best_score = sentence, score
-    return _truncate(best, MAX_EXCERPT_CHARS)
+    return _truncate_verbatim(best, MAX_EXCERPT_CHARS)
 
 
 def _finalize_anomalies(items: list[_Anomaly], regulation_text: str) -> list[dict]:
@@ -465,8 +476,10 @@ def _validate_analysis_inputs(regulation_text: Any, state: Any) -> str:
         raise ValueError("current_company_state_dict must not be empty")
     try:
         state_json = json.dumps(state, indent=2, sort_keys=True, default=str)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"current_company_state_dict is not JSON-serializable: {exc}") from None
+    except Exception as exc:  # TypeError, ValueError, RecursionError, a failing __str__ ...
+        raise ValueError(
+            f"current_company_state_dict is not JSON-serializable or too deeply nested ({type(exc).__name__})"
+        ) from None
     if len(state_json) > MAX_STATE_CHARS:
         raise ValueError(f"current_company_state_dict exceeds {MAX_STATE_CHARS} serialized characters")
     return state_json
@@ -486,24 +499,22 @@ def analyze_compliance_gap(
     _check_api_key(api_key)
     prompt = build_analysis_prompt(regulation_text, state_json)
 
-    last_error: Exception | None = None
+    # call_llm already retries unusable output (and its LLMOutputError propagates), so
+    # this loop only re-asks when the JSON parses but fails schema validation.
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        payload = call_llm(
+            prompt, ANALYSIS_SYSTEM_PROMPT, json_mode=True, schema=ANALYSIS_SCHEMA, api_key=api_key
+        )
         try:
-            payload = call_llm(
-                prompt, ANALYSIS_SYSTEM_PROMPT, json_mode=True, schema=ANALYSIS_SCHEMA, api_key=api_key
-            )
             parsed = _AnalysisPayload.model_validate(payload)
-            return _finalize_anomalies(parsed.anomalies, regulation_text)
         except ValidationError as exc:
-            last_error = exc
             logger.warning(
                 "analyze_compliance_gap attempt %d/%d: schema validation failed (%d errors)",
                 attempt, MAX_ATTEMPTS, exc.error_count(),
             )
-        except LLMOutputError as exc:
-            last_error = exc
-            logger.warning("analyze_compliance_gap attempt %d/%d: %s", attempt, MAX_ATTEMPTS, exc)
-    raise LLMOutputError(f"analysis output invalid after {MAX_ATTEMPTS} attempts: {type(last_error).__name__}")
+            continue
+        return _finalize_anomalies(parsed.anomalies, regulation_text)
+    raise LLMOutputError(f"analysis output failed schema validation {MAX_ATTEMPTS} times")
 
 
 # --------------------------------------------------------------------------- audit trail
@@ -690,6 +701,10 @@ def _strip_markdown_fences(text: str) -> str:
     match = re.search(r"^# Compliance Audit Log\s*$", text, re.MULTILINE)
     if match and match.start() > 0:
         text = text[match.start():]
+    # A fenced block with prose around it leaves an unmatched closing fence: cut from there.
+    fences = list(re.finditer(r"^\s*```[^\n]*$", text, re.MULTILINE))
+    if len(fences) % 2 == 1:
+        text = text[: fences[-1].start()]
     return text.strip() + "\n"
 
 
@@ -704,8 +719,10 @@ def _audit_is_valid(markdown: str, iso: str, anomalies: list[dict]) -> bool:
     for heading in ("## 1. Executive Summary", "## 2. Findings Summary", "## 3. Detailed Findings", "## 4. Audit Trail"):
         if heading not in markdown:
             return False
-    allowed = set(_DATE_RE.findall(json.dumps(anomalies, ensure_ascii=False)))
-    for found in _DATE_RE.findall(markdown.replace(iso, "")):
+    # Dates that appear in the input anomalies may be quoted; any other date or time is invented.
+    haystack = " ".join(" ".join(str(v).split()) for a in anomalies for v in a.values())
+    allowed = set(_DATE_RE.findall(haystack))
+    for found in _DATE_RE.findall(" ".join(markdown.replace(iso, " ").split())):
         if found not in allowed:
             return False
     return True
@@ -718,7 +735,10 @@ def _resolve_generated_at(generated_at: Any) -> datetime:
         raise ValueError("generated_at must be a datetime or None")
     if generated_at.tzinfo is None or generated_at.utcoffset() is None:
         raise ValueError("generated_at must be timezone-aware")
-    return generated_at.astimezone(timezone.utc).replace(microsecond=0)
+    try:
+        return generated_at.astimezone(timezone.utc).replace(microsecond=0)
+    except (OverflowError, OSError, ValueError):
+        raise ValueError("generated_at is out of range") from None
 
 
 def generate_audit_trail(
@@ -751,7 +771,7 @@ def generate_audit_trail(
             text = call_llm(prompt, AUDIT_SYSTEM_PROMPT, json_mode=False, api_key=api_key)
         except LLMOutputError as exc:
             logger.warning("generate_audit_trail attempt %d/%d: %s", attempt, AUDIT_ATTEMPTS, exc)
-            continue
+            break  # call_llm already retried; go straight to the fallback
         markdown = _strip_markdown_fences(str(text))
         if _audit_is_valid(markdown, iso, items):
             return markdown

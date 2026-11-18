@@ -439,6 +439,80 @@ def test_end_to_end_with_fake_provider(provider):
     json.dumps({"anomalies": anomalies, "audit": md})
 
 
+# --------------------------------------------------------------------------- review fixes
+
+
+def test_persistent_output_error_is_capped_at_three_calls(provider):
+    fake = provider(LLMOutputError("refusal"))
+    with pytest.raises(LLMOutputError):
+        analyze_compliance_gap(REGULATION, STATE)
+    assert len(fake.calls) == 3
+
+
+def test_audit_persistent_output_error_goes_to_fallback_after_three_calls(provider):
+    fake = provider(LLMOutputError("truncated"))
+    md = generate_audit_trail(anomalies_with_ids(), generated_at=GENERATED_AT)
+    assert len(fake.calls) == 3
+    assert md.startswith("# Compliance Audit Log")
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        lambda md: "Here is the log:\n\n```markdown\n" + md + "```\n",
+        lambda md: "```markdown\n" + md + "```\n\nLet me know if you need changes.",
+        lambda md: "Sure!\n```\n" + md + "```\nThanks",
+    ],
+)
+def test_audit_fence_with_surrounding_prose_is_cleaned(provider, wrap):
+    anoms = anomalies_with_ids()
+    provider(wrap(good_markdown(anoms)))
+    md = generate_audit_trail(anoms, generated_at=GENERATED_AT)
+    assert "```" not in md and "Let me know" not in md and "Thanks" not in md
+    assert md.startswith("# Compliance Audit Log")
+    assert md.rstrip().endswith("| Report generated | AI Compliance Engine |")
+
+
+def test_deeply_nested_state_is_value_error(provider):
+    fake = provider('{"anomalies": []}')
+    state = {}
+    node = state
+    for _ in range(3000):
+        node["k"] = {}
+        node = node["k"]
+    with pytest.raises(ValueError):
+        analyze_compliance_gap(REGULATION, state)
+    assert fake.calls == []
+
+
+def test_out_of_range_generated_at_is_value_error(provider):
+    provider("x")
+    plus14 = timezone(timedelta(hours=14))
+    with pytest.raises(ValueError):
+        generate_audit_trail(anomalies_with_ids(), generated_at=datetime.min.replace(tzinfo=plus14))
+
+
+def test_long_excerpt_stays_verbatim(provider):
+    long_sentence = "Every regulated entity must " + "retain and protect records " * 20 + "for 90 days."
+    regulation = "Section 1. " + long_sentence
+    provider({"anomalies": [make_anomaly(regulation_excerpt=long_sentence)]})
+    [a] = analyze_compliance_gap(regulation, STATE)
+    assert len(a["regulation_excerpt"]) <= 200
+    assert a["regulation_excerpt"] in regulation
+
+
+@pytest.mark.parametrize("text", ["effective\n2027-01-01", "effective\t2027-01-01", "Due 2027-01-01  10:00"])
+def test_dates_from_input_are_allowed_even_with_odd_whitespace(provider, text):
+    anoms = anomalies_with_ids()
+    anoms[0]["regulation_excerpt"] = text
+    items = ai_engine._normalize_audit_items(anoms)
+    rendered = ai_engine._render_audit_fallback(items, ISO, "AUD-20261118T113800Z", "m")
+    assert _audit_is_valid(rendered, ISO, items)
+    fake = provider(rendered)
+    assert generate_audit_trail(anoms, generated_at=GENERATED_AT) == rendered
+    assert len(fake.calls) == 1
+
+
 # --------------------------------------------------------------------------- 5. config
 
 
