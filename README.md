@@ -155,6 +155,26 @@ pytest -m live                        # real API: retention gap, compliant state
 | `LLM_TIMEOUT_SECONDS` | `60` | Per-read timeout. Requests are streamed. |
 | `LLM_EFFORT` | `medium` | `low` to `max`. |
 
+### API
+
+```bash
+uvicorn main:app --reload          # http://127.0.0.1:8000/docs
+```
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/health` | none | `{"status": "ok"}` |
+| GET | `/api/system-state` | none | the mock company profile (`mock_db.py`) |
+| POST | `/api/analyze-regulation` | `{"text": "...", "company_state": {...}?}` | list of anomalies |
+| POST | `/api/generate-audit` | `{"anomalies": [...]}` or `{"text": "...", "company_state": {...}?}` | `{"anomalies": [...], "markdown": "..."}` |
+
+- Send the user's own key in the optional `X-Anthropic-Api-Key` header.
+- `company_state` defaults to the mock profile.
+- Errors return a `detail.error` code:
+  - **422:** `INVALID_INPUT`, for bad input.
+  - **401:** `LLM_AUTH`, when the key is missing or rejected.
+  - **502:** `LLM_UNAVAILABLE`, when the provider fails.
+
 ### Contract for the API layer
 
 ```python
