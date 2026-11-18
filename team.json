@@ -1,9 +1,11 @@
 {
-  "team_name": "RTY",
-  "project_title": "AI Compliance Engine",
-  "one_liner": "Paste in a new regulation and get every compliance gap, each tied to a verbatim quote, plus an audit-ready compliance log.",
+  "team_name": "Starscourge",
+  "project_title": "Compliance Copilot",
+  "one_liner": "Paste a new regulation and get every compliance gap, each quoted verbatim, plus an audit-ready log.",
   "track": "area-of-expertise",
   "members": [
-    { "name": "Shreyas Bhandari", "github": "Dukeatron" }
+    { "name": "Shreyas Bhandari", "github": "TODO" },
+    { "name": "Aaryan Prakash", "github": "TODO" },
+    { "name": "Gurvansh Singh Sachdeva", "github": "TODO" }
   ]
 }
