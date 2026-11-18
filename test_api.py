@@ -89,6 +89,36 @@ def test_byok_header_reaches_the_provider(fake_provider):
     assert calls[0]["api_key"] == "user-key"
 
 
+def test_generic_key_provider_and_model_headers(fake_provider):
+    calls = fake_provider('{"anomalies": []}')
+    response = client.post(
+        "/api/analyze-regulation", json={"text": REGULATION},
+        headers={"X-LLM-Api-Key": "AIzaSyX", "X-LLM-Provider": "Gemini", "X-LLM-Model": "gemini-2.5-pro"},
+    )
+    assert response.status_code == 200
+    assert calls[0]["api_key"] == "AIzaSyX"
+    assert calls[0]["provider"] == "gemini" and calls[0]["model"] == "gemini-2.5-pro"
+
+
+def test_legacy_anthropic_header_sets_provider(fake_provider):
+    calls = fake_provider('{"anomalies": []}')
+    client.post("/api/analyze-regulation", json={"text": REGULATION}, headers={"X-Anthropic-Api-Key": "k"})
+    assert calls[0]["provider"] == "anthropic"
+
+
+def test_unknown_provider_header_is_422(fake_provider):
+    fake_provider('{"anomalies": []}')
+    response = client.post(
+        "/api/analyze-regulation", json={"text": REGULATION}, headers={"X-LLM-Provider": "nope"}
+    )
+    assert response.status_code == 422
+
+
+def test_providers_endpoint_lists_providers():
+    body = client.get("/api/providers").json()
+    assert "anthropic" in body["providers"] and "gemini" in body["providers"] and "openai" in body["providers"]
+
+
 def test_generate_audit_from_text_runs_analysis_then_audit(fake_provider):
     calls = fake_provider(json.dumps({"anomalies": [finding()]}), "not a valid audit log")
     response = client.post("/api/generate-audit", json={"text": REGULATION})
@@ -140,10 +170,13 @@ def test_bad_anomaly_shape_maps_to_422(fake_provider):
 
 
 def test_missing_key_maps_to_401(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for name in ai_engine.PROVIDERS:
+        for var in ai_engine._key_env_vars(name):
+            monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
     response = client.post("/api/analyze-regulation", json={"text": REGULATION})
     assert response.status_code == 401
-    assert "X-Anthropic-Api-Key" in response.json()["detail"]["message"]
+    assert "X-LLM-Api-Key" in response.json()["detail"]["message"]
 
 
 def test_provider_failure_maps_to_502(fake_provider):
@@ -173,7 +206,7 @@ def test_cors_allows_the_key_header():
         headers={
             "Origin": "http://localhost:5173",
             "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "x-anthropic-api-key,content-type",
+            "Access-Control-Request-Headers": "x-llm-api-key,x-llm-provider,x-llm-model,content-type",
         },
     )
     assert response.status_code == 200

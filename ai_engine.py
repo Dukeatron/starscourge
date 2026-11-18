@@ -5,17 +5,22 @@ Public contract (imported by the API layer):
     from ai_engine import analyze_compliance_gap, generate_audit_trail, LLMError
 
 All functions are synchronous and return plain JSON-serializable Python objects.
-Bring your own key: every public function takes an optional keyword-only `api_key`, so
-each end user can run the engine on their own Anthropic API key. When `api_key` is not
-given, ANTHROPIC_API_KEY from the environment is used. Keys are never logged or stored
-beyond the in-memory SDK client cache.
 
-Configuration is read from the environment at call time, never at import time:
+Bring your own key and model: every public function takes optional keyword-only
+`api_key`, `provider` and `model`. Providers: anthropic (native Claude API) plus any
+OpenAI-compatible API: openai, gemini, groq, openrouter, deepseek, mistral, xai,
+together, ollama and custom (LLM_BASE_URL). With a key but no provider, the provider is
+detected from the key prefix (sk-ant-, sk-, AIza, gsk_, sk-or-, xai-).
 
-    ANTHROPIC_API_KEY     required unless the caller passes api_key=
-    LLM_MODEL             optional, default "claude-sonnet-5-5"
+Configuration is read from the environment (or a gitignored .env) at call time, never
+at import time, and keys are never logged:
+
+    LLM_PROVIDER          optional; default: the first provider whose key is set, else anthropic
+    LLM_MODEL             optional; per provider: <PROVIDER>_MODEL (e.g. GEMINI_MODEL)
+    ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
+    DEEPSEEK_API_KEY, MISTRAL_API_KEY, XAI_API_KEY, TOGETHER_API_KEY, LLM_API_KEY (custom)
     LLM_TIMEOUT_SECONDS   optional, default 60
-    LLM_EFFORT            optional (low | medium | high | xhigh | max), default "medium"
+    LLM_EFFORT            optional (Claude only: low | medium | high | xhigh | max), default "medium"
 """
 
 from __future__ import annotations
