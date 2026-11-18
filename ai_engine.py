@@ -15,7 +15,7 @@ detected from the key prefix (sk-ant-, sk-, AIza, gsk_, sk-or-, xai-).
 Configuration is read from the environment (or a gitignored .env) at call time, never
 at import time, and keys are never logged:
 
-    LLM_PROVIDER          optional; default: the first provider whose key is set, else anthropic
+    LLM_PROVIDER          optional; default "ollama" (smallest locally installed model)
     LLM_MODEL             optional; per provider: <PROVIDER>_MODEL (e.g. GEMINI_MODEL)
     ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
     DEEPSEEK_API_KEY, MISTRAL_API_KEY, XAI_API_KEY, TOGETHER_API_KEY, LLM_API_KEY (custom)
@@ -144,7 +144,7 @@ _OPENAI_COMPATIBLE: dict[str, tuple[str | None, tuple[str, ...], str]] = {
         ("TOGETHER_API_KEY",),
         "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     ),
-    "ollama": ("http://localhost:11434/v1", ("OLLAMA_API_KEY",), "llama3.1"),
+    "ollama": ("http://localhost:11434/v1", ("OLLAMA_API_KEY",), ""),  # default: smallest installed model
     "custom": (None, ("LLM_API_KEY",), ""),  # any OpenAI-compatible server: set LLM_BASE_URL + LLM_MODEL
 }
 PROVIDERS: tuple[str, ...] = ("anthropic",) + tuple(_OPENAI_COMPATIBLE)
@@ -203,18 +203,42 @@ def _env_key(provider: str) -> str:
     return ""
 
 
+DEFAULT_PROVIDER = "ollama"  # local models by default: no key, no cost, no data leaves the machine
+OLLAMA_FALLBACK_MODEL = "qwen2.5vl:3b"
+_ollama_default: str | None = None
+
+
 def _env_provider() -> str:
-    """Provider when the caller names none: LLM_PROVIDER, else the first provider with a key set."""
+    """Provider when the caller names none: LLM_PROVIDER, else DEFAULT_PROVIDER (ollama)."""
     _load_dotenv()
     configured = os.environ.get("LLM_PROVIDER", "").strip().lower()
     if configured:
         if configured not in PROVIDERS:
             raise LLMConfigError(f"LLM_PROVIDER must be one of {', '.join(PROVIDERS)}")
         return configured
-    for name in PROVIDERS:
-        if name not in ("ollama", "custom") and _env_key(name):
-            return name
-    return "anthropic"
+    return DEFAULT_PROVIDER
+
+
+def _smallest_ollama_model() -> str:
+    """Smallest model installed on the local Ollama server (cached), else OLLAMA_FALLBACK_MODEL."""
+    global _ollama_default
+    if _ollama_default:
+        return _ollama_default
+    import urllib.request
+
+    base = (_resolve_base_url("ollama") or "http://localhost:11434/v1").rstrip("/")
+    root = base[: -len("/v1")] if base.endswith("/v1") else base
+    try:
+        with urllib.request.urlopen(root + "/api/tags", timeout=2) as response:
+            models = json.load(response).get("models") or []
+        sized = [(int(m.get("size") or 0), str(m.get("name") or m.get("model"))) for m in models]
+        sized = [m for m in sized if m[0] > 0 and m[1] and m[1] != "None"]
+        if sized:
+            _ollama_default = min(sized)[1]
+            return _ollama_default
+    except Exception:  # server down or unexpected payload: use the fallback, retry next call
+        pass
+    return OLLAMA_FALLBACK_MODEL
 
 
 def _check_llm_args(api_key: Any, provider: Any = None, model: Any = None) -> None:
@@ -253,6 +277,8 @@ def _resolve_model(provider: str, model: str | None = None) -> str:
         return generic
     if provider == "anthropic":
         return DEFAULT_MODEL
+    if provider == "ollama":
+        return _smallest_ollama_model()
     default = _OPENAI_COMPATIBLE[provider][2]
     if not default:
         raise LLMConfigError("provider 'custom' needs a model: pass model= or set LLM_MODEL")
