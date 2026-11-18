@@ -37,8 +37,8 @@ def fake_provider(monkeypatch):
     def install(*outputs):
         queue = list(outputs)
 
-        def fake(prompt, system_message, json_mode, schema, temperature, max_tokens, *, api_key=None):
-            calls.append({"json_mode": json_mode, "api_key": api_key, "prompt": prompt})
+        def fake(prompt, system_message, json_mode, schema, temperature, max_tokens, *, api_key=None, provider=None, model=None):
+            calls.append({"json_mode": json_mode, "api_key": api_key, "prompt": prompt, "provider": provider, "model": model})
             out = queue.pop(0) if len(queue) > 1 else queue[0]
             if isinstance(out, Exception):
                 raise out

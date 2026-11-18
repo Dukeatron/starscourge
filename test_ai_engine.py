@@ -57,10 +57,10 @@ class FakeProvider:
         self.outputs = list(outputs)
         self.calls = []
 
-    def __call__(self, prompt, system_message, json_mode, schema, temperature, max_tokens, *, api_key=None):
+    def __call__(self, prompt, system_message, json_mode, schema, temperature, max_tokens, *, api_key=None, provider=None, model=None):
         self.calls.append(
             {"prompt": prompt, "system": system_message, "json_mode": json_mode, "schema": schema,
-             "api_key": api_key}
+             "api_key": api_key, "provider": provider, "model": model}
         )
         if not self.outputs:
             raise AssertionError("provider called more times than expected")
@@ -84,6 +84,11 @@ def provider(monkeypatch):
 def no_key(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setattr(ai_engine, "_clients", ai_engine.OrderedDict())
+    for name in ai_engine.PROVIDERS:
+        for var in ai_engine._key_env_vars(name):
+            monkeypatch.delenv(var, raising=False)
+    for var in ("LLM_PROVIDER", "LLM_MODEL", "LLM_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
 
 
 # --------------------------------------------------------------------------- 1. _coerce_json_object
@@ -521,7 +526,9 @@ def test_import_without_key_and_call_raises_config_error():
     import subprocess
     import sys
 
-    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    key_vars = {v for p in ai_engine.PROVIDERS for v in ai_engine._key_env_vars(p)}
+    env = {k: v for k, v in os.environ.items() if k not in key_vars}
+    env["AI_ENGINE_DOTENV"] = "0"
     code = (
         "import ai_engine\n"
         "try:\n"
@@ -591,7 +598,7 @@ def test_provider_request_shape(no_key, monkeypatch):
         class beta:  # noqa: N801
             messages = Messages()
 
-    monkeypatch.setattr(ai_engine, "_get_client", lambda api_key=None: Client())
+    monkeypatch.setattr(ai_engine, "_get_client", lambda *a, **k: Client())
     monkeypatch.setenv("LLM_MODEL", "claude-test")
     out = ai_engine._provider_complete("p", "s", True, ai_engine.ANALYSIS_SCHEMA, 0.0, 1000)
     assert out == '{"anomalies": []}'
@@ -668,13 +675,204 @@ def test_byok_rejected_key_maps_to_config_error(no_key, monkeypatch):
         class beta:  # noqa: N801
             messages = Messages()
 
-    monkeypatch.setattr(ai_engine, "_get_client", lambda api_key=None: Client())
+    monkeypatch.setattr(ai_engine, "_get_client", lambda *a, **k: Client())
     with pytest.raises(LLMConfigError, match="rejected"):
         analyze_compliance_gap(REGULATION, STATE, api_key="sk-ant-bad")
 
 
 def test_empty_audit_needs_no_key(no_key):
     assert generate_audit_trail([], generated_at=GENERATED_AT).startswith("# Compliance Audit Log")
+
+
+# --------------------------------------------------------------------------- 7. other providers
+
+
+class _Choice:
+    def __init__(self, content, finish_reason="stop", refusal=None):
+        self.finish_reason = finish_reason
+        self.message = type("Msg", (), {"content": content, "refusal": refusal})()
+
+
+class FakeOpenAIClient:
+    """Stub of openai.OpenAI: records every request; raises queued errors first."""
+
+    def __init__(self, content='{"anomalies": []}', errors=(), finish_reason="stop", refusal=None):
+        self.requests, self.errors = [], list(errors)
+        outer = self
+
+        class Completions:
+            def create(self, **kwargs):
+                outer.requests.append(kwargs)
+                if outer.errors:
+                    raise outer.errors.pop(0)
+                return type("Resp", (), {"choices": [_Choice(content, finish_reason, refusal)]})()
+
+        self.chat = type("Chat", (), {"completions": Completions()})()
+
+
+def _bad_request(message):
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+    return openai.BadRequestError(message, response=httpx.Response(400, request=request), body=None)
+
+
+@pytest.mark.parametrize(
+    "key, provider",
+    [("sk-ant-abc", "anthropic"), ("sk-proj-abc", "openai"), ("AIzaSyabc", "gemini"),
+     ("gsk_abc", "groq"), ("sk-or-v1-abc", "openrouter"), ("xai-abc", "xai")],
+)
+def test_provider_detected_from_key_prefix(no_key, key, provider):
+    assert ai_engine._resolve_provider(None, key) == provider
+
+
+def test_explicit_provider_wins_over_key_prefix(no_key):
+    assert ai_engine._resolve_provider("deepseek", "sk-abc") == "deepseek"
+
+
+def test_env_provider_falls_back_to_first_configured_key(no_key, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_x")
+    assert ai_engine._resolve_provider() == "groq"
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    assert ai_engine._resolve_provider() == "mistral"
+
+
+def test_unknown_provider_is_value_error(provider):
+    fake = provider('{"anomalies": []}')
+    with pytest.raises(ValueError):
+        analyze_compliance_gap(REGULATION, STATE, provider="not-a-provider")
+    assert fake.calls == []
+
+
+def test_provider_and_model_are_passed_through(provider):
+    fake = provider({"anomalies": [make_anomaly()]}, "garbage")
+    anomalies = analyze_compliance_gap(REGULATION, STATE, api_key="k", provider="gemini", model="gemini-x")
+    md = generate_audit_trail(anomalies, generated_at=GENERATED_AT, api_key="k", provider="gemini", model="gemini-x")
+    assert all(c["provider"] == "gemini" and c["model"] == "gemini-x" for c in fake.calls)
+    assert "(model: gemini-x)" in md
+
+
+def test_default_models_per_provider(no_key):
+    assert ai_engine._resolve_model("anthropic") == "claude-sonnet-5-5"
+    assert ai_engine._resolve_model("gemini") == "gemini-2.5-flash"
+    assert ai_engine._resolve_model("openai", "gpt-custom") == "gpt-custom"
+
+
+def test_provider_specific_model_env(no_key, monkeypatch):
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-pro-x")
+    assert ai_engine._resolve_model("gemini") == "gemini-pro-x"
+
+
+def test_custom_provider_needs_base_url_and_model(no_key, monkeypatch):
+    with pytest.raises(LLMConfigError):
+        ai_engine._resolve_model("custom")
+    with pytest.raises(LLMConfigError):
+        ai_engine._resolve_base_url("custom")
+    monkeypatch.setenv("LLM_BASE_URL", "http://localhost:8001/v1")
+    assert ai_engine._resolve_base_url("custom") == "http://localhost:8001/v1"
+
+
+def test_openai_compatible_client_uses_provider_base_url(no_key):
+    client = ai_engine._get_client("AIzaSyTEST", None)
+    assert "generativelanguage.googleapis.com" in str(client.base_url)
+    assert client.api_key == "AIzaSyTEST"
+    assert ai_engine._get_client("AIzaSyTEST", None) is client
+
+
+def test_missing_key_for_other_provider_names_env_var(no_key):
+    with pytest.raises(LLMConfigError, match="OPENAI_API_KEY"):
+        ai_engine._get_client(None, "openai")
+
+
+def test_ollama_needs_no_key(no_key):
+    assert ai_engine._get_client(None, "ollama").api_key == "ollama"
+
+
+def test_openai_compatible_request_uses_strict_json_schema():
+    client = FakeOpenAIClient('{"anomalies": []}')
+    out = ai_engine._openai_compatible_complete(
+        client, "gemini", "gemini-2.5-flash", "p", "s", True, ai_engine.ANALYSIS_SCHEMA, 0.0, 1000
+    )
+    assert out == '{"anomalies": []}'
+    req = client.requests[0]
+    assert req["response_format"]["type"] == "json_schema"
+    assert req["response_format"]["json_schema"]["strict"] is True
+    assert req["messages"][0]["role"] == "system" and "JSON Schema" in req["messages"][0]["content"]
+    assert req["max_tokens"] == 1000 and req["temperature"] == 0.0
+
+
+def test_openai_uses_max_completion_tokens():
+    client = FakeOpenAIClient("hello")
+    ai_engine._openai_compatible_complete(client, "openai", "gpt-5-mini", "p", "", False, None, 0.0, 500)
+    assert client.requests[0]["max_completion_tokens"] == 500 and "max_tokens" not in client.requests[0]
+
+
+def test_openai_compatible_degrades_rejected_parameters():
+    client = FakeOpenAIClient(
+        '{"anomalies": []}',
+        errors=[
+            _bad_request("Unsupported value: 'temperature' does not support 0.0"),
+            _bad_request("response_format json_schema is not supported for this model"),
+            _bad_request("response_format json_object is not supported"),
+        ],
+    )
+    out = ai_engine._openai_compatible_complete(
+        client, "groq", "llama", "p", "s", True, ai_engine.ANALYSIS_SCHEMA, 0.0, 1000
+    )
+    assert out == '{"anomalies": []}'
+    assert "temperature" not in client.requests[-1]
+    assert "response_format" not in client.requests[-1]
+    assert len(client.requests) == 4
+
+
+def test_openai_compatible_unrelated_bad_request_is_llm_error():
+    client = FakeOpenAIClient(errors=[_bad_request("context length exceeded")])
+    with pytest.raises(LLMError):
+        ai_engine._openai_compatible_complete(client, "openai", "m", "p", "", True, None, 0.0, 10)
+
+
+@pytest.mark.parametrize(
+    "kwargs, error",
+    [({"finish_reason": "length"}, LLMOutputError), ({"refusal": "no"}, LLMOutputError),
+     ({"content": ""}, LLMOutputError), ({"finish_reason": "content_filter"}, LLMOutputError)],
+)
+def test_openai_compatible_bad_outputs(kwargs, error):
+    client = FakeOpenAIClient(**{"content": "x", **kwargs})
+    with pytest.raises(error):
+        ai_engine._openai_compatible_complete(client, "openai", "m", "p", "", False, None, 0.0, 10)
+
+
+def test_openai_compatible_rejected_key_is_config_error():
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+    err = openai.AuthenticationError("bad key", response=httpx.Response(401, request=request), body=None)
+    client = FakeOpenAIClient(errors=[err])
+    with pytest.raises(LLMConfigError, match="rejected"):
+        ai_engine._openai_compatible_complete(client, "openai", "m", "p", "", False, None, 0.0, 10)
+
+
+def test_end_to_end_through_openai_compatible_path(no_key, monkeypatch):
+    payload = json.dumps({"anomalies": [make_anomaly()]})
+    client = FakeOpenAIClient(payload)
+    monkeypatch.setattr(ai_engine, "_get_client", lambda *a, **k: client)
+    [a] = analyze_compliance_gap(REGULATION, STATE, api_key="AIzaSyX")
+    assert a["id"] == "ANOM-001"
+    assert client.requests[0]["model"] == "gemini-2.5-flash"
+
+
+def test_dotenv_is_loaded_lazily_without_overriding(no_key, monkeypatch, tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text('# comment\nexport GROQ_API_KEY="gsk_from_file"\nOPENAI_API_KEY=from-file\n')
+    monkeypatch.setenv("OPENAI_API_KEY", "from-env")
+    monkeypatch.setattr(ai_engine, "_dotenv_loaded", False)
+    monkeypatch.setenv("AI_ENGINE_DOTENV", "1")
+    monkeypatch.setattr(ai_engine.os.path, "abspath", lambda p: str(tmp_path / "ai_engine.py"))
+    ai_engine._load_dotenv()
+    assert os.environ["GROQ_API_KEY"] == "gsk_from_file"
+    assert os.environ["OPENAI_API_KEY"] == "from-env"
 
 
 # --------------------------------------------------------------------------- live tests
