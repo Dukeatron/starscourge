@@ -118,62 +118,11 @@ See [RULES.md](RULES.md) for the full list.
 
 ## Your project
 
-### AgentShield
-
-AgentShield is a guard proxy that sits between AI agents and the third-party APIs they call, catching runaway retry loops before they get the shared IP banned. It answers repeated calls from cache, blocks identical payloads that loop, and shows live what it saved.
-
-- **Team:** _TODO: team name_
-- **Track:** `ai-agents`
-- **Problem:** Teams running AI agents against rate-limited APIs (for example a Shopify order-sync agent) watch them get stuck re-sending the same request. The agent has no memory of what it just sent and treats every error as "try again", so within seconds it trips the upstream rate limit and the provider bans the IP, taking every integration on that IP down with it.
-- **What we built:** a FastAPI backend with a mock rate-limited upstream (4 calls per 10 s, then a 60 s IP ban), a `/proxy` route that runs every agent call through the AgentShield engine, live `/stats` and `/logs`, and two one-click demos that send the same agent traffic with and without the shield.
-- **The hardest part:** _TODO: the proxy engine's loop detection (engine owner)._ On the backend: one in-memory source of truth with strict lock ordering, demos that run as cancellable tasks tagged with a generation number so a reset can never let a stale request slip in, and a metric invariant (`total = passed + cached + blocked + upstream_banned`) asserted after every test scenario.
-- **Demo / screenshots:** see the demo commands below.
-
-### Setup
-
-Requires Python 3.10+.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements-dev.txt
-```
-
-### Run
-
-```bash
-uvicorn main:app --host 127.0.0.1 --port 8000
-```
-
-> **Single worker only.** All state (rate-limit window, ban, metrics, logs) lives in process memory. Running with `--workers 2` or more splits that state between processes and the numbers stop adding up.
-
-### Test
-
-```bash
-pytest -q
-```
-
-Tests use a fake engine injected by `tests/conftest.py`. The two tests that need the real engine (protected demo counts) skip automatically when `proxy_engine.py` is missing or still the temporary stub.
-
-### Routes
-
-| Method | Path | What it does | Success | Errors |
-| --- | --- | --- | --- | --- |
-| GET | `/` | Serves `index.html` | 200 | 404 `{"error":"FRONTEND_NOT_FOUND"}` if the file is missing |
-| POST | `/target-api` | Calls the mock upstream directly (no protection). Body optional: `{"agent_id": "...", "payload": {...}}` | 200 upstream body | 403 `IP_BANNED` |
-| POST | `/proxy` | Sends a call through AgentShield. Body: `{"agent_id", "endpoint", "payload"}` | 200, or 429 `BLOCKED` with a `Retry-After` header | 403 passed through, 422 invalid body, 500 `INTERNAL_ERROR` |
-| POST | `/demo/unprotected` | Starts the unprotected demo (7 direct calls, 0.2 s apart) | 202 `{"status":"started","demo":"unprotected"}` | 409 `{"error":"DEMO_ALREADY_RUNNING","demo":"..."}` |
-| POST | `/demo/protected` | Starts the protected demo (the same 7 calls through the proxy) | 202 `{"status":"started","demo":"protected"}` | 409 as above |
-| POST | `/demo/reset` | Cancels any running demo and clears all state | 200 `{"status":"reset"}` | none |
-| GET | `/demo/status` | Whether a demo is running | 200 `{"running": bool, "demo": str or null}` | none |
-| GET | `/stats` | `ip_status`, `ban_remaining_sec`, `total_calls`, `passed_calls`, `cached_calls`, `blocked_calls`, `bans_prevented`, `dollars_saved` | 200 | none |
-| GET | `/logs` | Newest 50 log entries, newest first | 200 | none |
-
-### Demo
-
-```bash
-curl -s -X POST localhost:8000/demo/unprotected   # 202
-sleep 2 && curl -s localhost:8000/stats           # passed_calls 4, ip_status BANNED
-curl -s -X POST localhost:8000/demo/protected     # 202, starts from a clean slate
-sleep 2 && curl -s localhost:8000/stats           # passed 1, cached 1, blocked 5, HEALTHY
-```
+_Replace this section with your project README:_
+- **Team:**
+- **Track:**
+- **Problem:** who faces it and why it happens
+- **What we built:** the core workflow
+- **The hardest part:** how we solved it
+- **How to run it:**
+- **Demo / screenshots:**
