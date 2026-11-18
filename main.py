@@ -13,6 +13,8 @@ from typing import Any, Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pathlib import Path
 
 from ai_engine import PROVIDERS, LLMConfigError, LLMError, analyze_compliance_gap, generate_audit_trail
 from mock_db import get_compliance_state
@@ -74,6 +76,15 @@ def llm_options(
         key = _clean(x_anthropic_api_key)
         provider = provider or "anthropic"
     return {"api_key": key, "provider": provider.lower() if provider else None, "model": _clean(x_llm_model)}
+
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    """Serve the single-page frontend."""
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 @app.get("/health")
