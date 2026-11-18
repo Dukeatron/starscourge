@@ -5,9 +5,14 @@ Public contract (imported by the API layer):
     from ai_engine import analyze_compliance_gap, generate_audit_trail, LLMError
 
 All functions are synchronous and return plain JSON-serializable Python objects.
+Bring your own key: every public function takes an optional keyword-only `api_key`, so
+each end user can run the engine on their own Anthropic API key. When `api_key` is not
+given, ANTHROPIC_API_KEY from the environment is used. Keys are never logged or stored
+beyond the in-memory SDK client cache.
+
 Configuration is read from the environment at call time, never at import time:
 
-    ANTHROPIC_API_KEY     required
+    ANTHROPIC_API_KEY     required unless the caller passes api_key=
     LLM_MODEL             optional, default "claude-sonnet-5-5"
     LLM_TIMEOUT_SECONDS   optional, default 60
     LLM_EFFORT            optional (low | medium | high | xhigh | max), default "medium"
@@ -16,12 +21,14 @@ Configuration is read from the environment at call time, never at import time:
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import logging
 import os
 import re
 import threading
 import unicodedata
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -116,25 +123,39 @@ def _effort() -> str:
 
 # --------------------------------------------------------------------------- client
 
-_client: anthropic.Anthropic | None = None
-_client_config: tuple[str, float] | None = None
+_MAX_CACHED_CLIENTS = 64
+_clients: OrderedDict[tuple[str, float], anthropic.Anthropic] = OrderedDict()
 _client_lock = threading.Lock()
 
 
-def _get_client() -> anthropic.Anthropic:
-    """Lazy singleton. Reads the key at call time; rebuilds if the key or timeout changed."""
-    global _client, _client_config
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        raise LLMConfigError("ANTHROPIC_API_KEY is not set")
-    config = (api_key, _timeout_seconds())
+def _check_api_key(api_key: Any) -> None:
+    """Reject a malformed caller-supplied key before any work is done."""
+    if api_key is not None and (not isinstance(api_key, str) or not api_key.strip()):
+        raise ValueError("api_key must be a non-empty string or None")
+
+
+def _get_client(api_key: str | None = None) -> anthropic.Anthropic:
+    """Lazy, cached SDK client for the caller's key (or ANTHROPIC_API_KEY).
+
+    The key is read at call time, never at import time. One client is kept per
+    (key, timeout), keyed by a hash so plaintext keys are not used as dict keys;
+    the least recently used client is dropped beyond _MAX_CACHED_CLIENTS.
+    """
+    key = (api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")).strip()
+    if not key:
+        raise LLMConfigError("no API key: pass api_key= or set ANTHROPIC_API_KEY")
+    timeout = _timeout_seconds()
+    cache_key = (hashlib.sha256(key.encode()).hexdigest(), timeout)
     with _client_lock:
-        if _client is None or _client_config != config:
-            _client = anthropic.Anthropic(
-                api_key=api_key, timeout=config[1], max_retries=SDK_MAX_RETRIES
-            )
-            _client_config = config
-        return _client
+        client = _clients.get(cache_key)
+        if client is None:
+            client = anthropic.Anthropic(api_key=key, timeout=timeout, max_retries=SDK_MAX_RETRIES)
+            _clients[cache_key] = client
+            while len(_clients) > _MAX_CACHED_CLIENTS:
+                _clients.popitem(last=False)
+        else:
+            _clients.move_to_end(cache_key)
+        return client
 
 
 def _provider_complete(
@@ -144,6 +165,8 @@ def _provider_complete(
     schema: dict | None,
     temperature: float,
     max_tokens: int,
+    *,
+    api_key: str | None = None,
 ) -> dict | str:
     """The only function that touches the provider SDK. Swap this to change provider.
 
@@ -151,7 +174,7 @@ def _provider_complete(
     accepted for interface compatibility but not sent: current Claude models reject
     sampling parameters, and structured outputs already constrain the JSON shape.
     """
-    client = _get_client()
+    client = _get_client(api_key)
     system = system_message
     output_config: dict[str, Any] = {"effort": _effort()}
     if json_mode:
@@ -177,7 +200,7 @@ def _provider_complete(
         with client.beta.messages.stream(**kwargs) as stream:
             message = stream.get_final_message()
     except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
-        raise LLMConfigError(f"provider rejected the credentials ({type(exc).__name__})") from exc
+        raise LLMConfigError(f"the API key was rejected by the provider ({type(exc).__name__})") from exc
     except anthropic.NotFoundError as exc:
         raise LLMConfigError(f"model '{_model_name()}' not found") from exc
     except anthropic.APIStatusError as exc:
@@ -247,20 +270,26 @@ def call_llm(
     schema: dict | None = None,
     temperature: float = 0.0,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    api_key: str | None = None,
 ) -> dict | str:
-    """Send one prompt to the LLM. JSON mode returns a dict; text mode returns a str."""
+    """Send one prompt to the LLM. JSON mode returns a dict; text mode returns a str.
+
+    `api_key` overrides ANTHROPIC_API_KEY for this call (bring your own key).
+    """
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt must be a non-empty string")
     if not isinstance(system_message, str):
         raise ValueError("system_message must be a string")
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         raise ValueError("max_tokens must be a positive integer")
+    _check_api_key(api_key)
 
     last_error: LLMOutputError | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             raw = _provider_complete(
-                prompt, system_message, json_mode, schema, temperature, max_tokens
+                prompt, system_message, json_mode, schema, temperature, max_tokens,
+                api_key=api_key,
             )
             if json_mode:
                 return _coerce_json_object(raw)
@@ -443,20 +472,26 @@ def _validate_analysis_inputs(regulation_text: Any, state: Any) -> str:
     return state_json
 
 
-def analyze_compliance_gap(regulation_text: str, current_company_state_dict: dict) -> list[dict]:
+def analyze_compliance_gap(
+    regulation_text: str, current_company_state_dict: dict, *, api_key: str | None = None
+) -> list[dict]:
     """Compare a regulation against the company's current state and list the gaps.
 
     Returns anomaly dicts sorted most-severe first, with ids ANOM-001, ANOM-002, ...
-    An empty list means no gaps were found. Raises ValueError on bad input and
+    An empty list means no gaps were found. `api_key` lets the end user supply their own
+    Anthropic key (default: ANTHROPIC_API_KEY). Raises ValueError on bad input and
     LLMError (or a subclass) when the model cannot produce a valid result.
     """
     state_json = _validate_analysis_inputs(regulation_text, current_company_state_dict)
+    _check_api_key(api_key)
     prompt = build_analysis_prompt(regulation_text, state_json)
 
     last_error: Exception | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            payload = call_llm(prompt, ANALYSIS_SYSTEM_PROMPT, json_mode=True, schema=ANALYSIS_SCHEMA)
+            payload = call_llm(
+                prompt, ANALYSIS_SYSTEM_PROMPT, json_mode=True, schema=ANALYSIS_SCHEMA, api_key=api_key
+            )
             parsed = _AnalysisPayload.model_validate(payload)
             return _finalize_anomalies(parsed.anomalies, regulation_text)
         except ValidationError as exc:
@@ -686,15 +721,19 @@ def _resolve_generated_at(generated_at: Any) -> datetime:
     return generated_at.astimezone(timezone.utc).replace(microsecond=0)
 
 
-def generate_audit_trail(anomalies: list[dict], generated_at: datetime | None = None) -> str:
+def generate_audit_trail(
+    anomalies: list[dict], generated_at: datetime | None = None, *, api_key: str | None = None
+) -> str:
     """Turn anomalies into a formal Markdown compliance audit log.
 
     Always returns a Markdown string that follows the required structure. An empty list
     produces a deterministic "no gaps" log without calling the LLM. If the model's output
-    fails validation twice, a deterministic renderer is used instead. Raises ValueError on
+    fails validation twice, a deterministic renderer is used instead. `api_key` lets the end
+    user supply their own Anthropic key (default: ANTHROPIC_API_KEY). Raises ValueError on
     bad input and LLMError if the provider cannot be reached.
     """
     items = _normalize_audit_items(anomalies)
+    _check_api_key(api_key)
     when = _resolve_generated_at(generated_at)
     iso = when.strftime("%Y-%m-%dT%H:%M:%SZ")
     report_id = "AUD-" + when.strftime("%Y%m%dT%H%M%SZ")
@@ -709,7 +748,7 @@ def generate_audit_trail(anomalies: list[dict], generated_at: datetime | None = 
     )
     for attempt in range(1, AUDIT_ATTEMPTS + 1):
         try:
-            text = call_llm(prompt, AUDIT_SYSTEM_PROMPT, json_mode=False)
+            text = call_llm(prompt, AUDIT_SYSTEM_PROMPT, json_mode=False, api_key=api_key)
         except LLMOutputError as exc:
             logger.warning("generate_audit_trail attempt %d/%d: %s", attempt, AUDIT_ATTEMPTS, exc)
             continue

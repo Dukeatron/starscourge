@@ -57,9 +57,10 @@ class FakeProvider:
         self.outputs = list(outputs)
         self.calls = []
 
-    def __call__(self, prompt, system_message, json_mode, schema, temperature, max_tokens):
+    def __call__(self, prompt, system_message, json_mode, schema, temperature, max_tokens, *, api_key=None):
         self.calls.append(
-            {"prompt": prompt, "system": system_message, "json_mode": json_mode, "schema": schema}
+            {"prompt": prompt, "system": system_message, "json_mode": json_mode, "schema": schema,
+             "api_key": api_key}
         )
         if not self.outputs:
             raise AssertionError("provider called more times than expected")
@@ -82,8 +83,7 @@ def provider(monkeypatch):
 @pytest.fixture
 def no_key(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setattr(ai_engine, "_client", None)
-    monkeypatch.setattr(ai_engine, "_client_config", None)
+    monkeypatch.setattr(ai_engine, "_clients", ai_engine.OrderedDict())
 
 
 # --------------------------------------------------------------------------- 1. _coerce_json_object
@@ -481,6 +481,7 @@ def test_client_is_singleton_and_rebuilt_on_key_change(no_key, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "key-one")
     first = ai_engine._get_client()
     assert ai_engine._get_client() is first
+    assert first.max_retries == 3
     monkeypatch.setenv("ANTHROPIC_API_KEY", "key-two")
     assert ai_engine._get_client() is not first
 
@@ -516,7 +517,7 @@ def test_provider_request_shape(no_key, monkeypatch):
         class beta:  # noqa: N801
             messages = Messages()
 
-    monkeypatch.setattr(ai_engine, "_get_client", lambda: Client())
+    monkeypatch.setattr(ai_engine, "_get_client", lambda api_key=None: Client())
     monkeypatch.setenv("LLM_MODEL", "claude-test")
     out = ai_engine._provider_complete("p", "s", True, ai_engine.ANALYSIS_SCHEMA, 0.0, 1000)
     assert out == '{"anomalies": []}'
@@ -531,6 +532,75 @@ def test_provider_request_shape(no_key, monkeypatch):
     Message.stop_reason = "refusal"
     with pytest.raises(LLMOutputError):
         ai_engine._provider_complete("p", "s", True, None, 0.0, 1000)
+
+
+# --------------------------------------------------------------------------- 6. bring your own key
+
+
+def test_byok_key_is_passed_through_every_call(provider):
+    fake = provider({"anomalies": [make_anomaly()]}, "garbage")
+    anomalies = analyze_compliance_gap(REGULATION, STATE, api_key="user-key-123")
+    generate_audit_trail(anomalies, generated_at=GENERATED_AT, api_key="user-key-123")
+    assert [c["api_key"] for c in fake.calls] == ["user-key-123"] * 3  # 1 analysis + 2 audit attempts
+
+
+def test_byok_default_is_none_so_env_is_used(provider):
+    fake = provider('{"anomalies": []}')
+    analyze_compliance_gap(REGULATION, STATE)
+    assert fake.calls[0]["api_key"] is None
+
+
+@pytest.mark.parametrize("bad_key", ["", "   ", 123, b"bytes"])
+def test_byok_bad_key_is_value_error_without_calls(provider, bad_key):
+    fake = provider('{"anomalies": []}')
+    with pytest.raises(ValueError):
+        analyze_compliance_gap(REGULATION, STATE, api_key=bad_key)
+    with pytest.raises(ValueError):
+        generate_audit_trail(anomalies_with_ids(), generated_at=GENERATED_AT, api_key=bad_key)
+    with pytest.raises(ValueError):
+        call_llm("hello", api_key=bad_key)
+    assert fake.calls == []
+
+
+def test_byok_works_without_env_key(no_key):
+    client = ai_engine._get_client("user-key-abc")
+    assert client.api_key == "user-key-abc"
+    assert ai_engine._get_client("user-key-abc") is client
+    assert ai_engine._get_client("other-user-key") is not client
+    with pytest.raises(LLMConfigError):
+        ai_engine._get_client()  # no env key and none passed
+
+
+def test_byok_client_cache_is_bounded_and_hashes_keys(no_key):
+    for i in range(ai_engine._MAX_CACHED_CLIENTS + 10):
+        ai_engine._get_client(f"key-{i}")
+    assert len(ai_engine._clients) == ai_engine._MAX_CACHED_CLIENTS
+    assert all("key-" not in cache_key[0] for cache_key in ai_engine._clients)
+
+
+def test_byok_rejected_key_maps_to_config_error(no_key, monkeypatch):
+    import httpx
+
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    error = ai_engine.anthropic.AuthenticationError(
+        "invalid x-api-key", response=httpx.Response(401, request=request), body=None
+    )
+
+    class Messages:
+        def stream(self, **kwargs):
+            raise error
+
+    class Client:
+        class beta:  # noqa: N801
+            messages = Messages()
+
+    monkeypatch.setattr(ai_engine, "_get_client", lambda api_key=None: Client())
+    with pytest.raises(LLMConfigError, match="rejected"):
+        analyze_compliance_gap(REGULATION, STATE, api_key="sk-ant-bad")
+
+
+def test_empty_audit_needs_no_key(no_key):
+    assert generate_audit_trail([], generated_at=GENERATED_AT).startswith("# Compliance Audit Log")
 
 
 # --------------------------------------------------------------------------- live tests
