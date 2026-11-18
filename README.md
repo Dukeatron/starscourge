@@ -122,7 +122,7 @@ See [RULES.md](RULES.md) for the full list.
 
 Paste in a new regulation and a JSON snapshot of how the company is set up today. The engine lists every gap, each tied to a verbatim quote from the regulation, and writes a formal, audit-ready compliance log.
 
-- **Team:** RTY
+- **Team:** RTY (Shreyas Bhandari, Aaryan Prakash, Gurvansh Singh Sachdeva)
 - **Track:** `area-of-expertise`
 - **Problem:** Compliance officers and internal auditors at regulated companies (fintech, health, SaaS handling personal data) have to work out, by hand, what each new or amended regulation means for their current policies and systems. They read dense legal text clause by clause, compare it with retention settings, breach procedures and access reviews spread across teams, and then document the findings in a format an auditor or regulator will accept. It happens because regulations change faster than teams can re-read them. Obligations are buried in prose, and the record of who found what, and when, gets written up after the fact.
 - **What we built:** two pure-Python functions that an API layer imports. `analyze_compliance_gap(regulation_text, company_state)` returns structured, severity-sorted findings (`ANOM-001`…), and `generate_audit_trail(findings)` returns a Markdown audit log with an executive summary, a findings table, remediation plans and a timestamped audit trail.
