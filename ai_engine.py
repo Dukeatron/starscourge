@@ -5,17 +5,22 @@ Public contract (imported by the API layer):
     from ai_engine import analyze_compliance_gap, generate_audit_trail, LLMError
 
 All functions are synchronous and return plain JSON-serializable Python objects.
-Bring your own key: every public function takes an optional keyword-only `api_key`, so
-each end user can run the engine on their own Anthropic API key. When `api_key` is not
-given, ANTHROPIC_API_KEY from the environment is used. Keys are never logged or stored
-beyond the in-memory SDK client cache.
 
-Configuration is read from the environment at call time, never at import time:
+Bring your own key and model: every public function takes optional keyword-only
+`api_key`, `provider` and `model`. Providers: anthropic (native Claude API) plus any
+OpenAI-compatible API: openai, gemini, groq, openrouter, deepseek, mistral, xai,
+together, ollama and custom (LLM_BASE_URL). With a key but no provider, the provider is
+detected from the key prefix (sk-ant-, sk-, AIza, gsk_, sk-or-, xai-).
 
-    ANTHROPIC_API_KEY     required unless the caller passes api_key=
-    LLM_MODEL             optional, default "claude-sonnet-5-5"
+Configuration is read from the environment (or a gitignored .env) at call time, never
+at import time, and keys are never logged:
+
+    LLM_PROVIDER          optional; default: the first provider whose key is set, else anthropic
+    LLM_MODEL             optional; per provider: <PROVIDER>_MODEL (e.g. GEMINI_MODEL)
+    ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
+    DEEPSEEK_API_KEY, MISTRAL_API_KEY, XAI_API_KEY, TOGETHER_API_KEY, LLM_API_KEY (custom)
     LLM_TIMEOUT_SECONDS   optional, default 60
-    LLM_EFFORT            optional (low | medium | high | xhigh | max), default "medium"
+    LLM_EFFORT            optional (Claude only: low | medium | high | xhigh | max), default "medium"
 """
 
 from __future__ import annotations
@@ -52,6 +57,7 @@ __all__ = [
     "call_llm",
     "analyze_compliance_gap",
     "generate_audit_trail",
+    "PROVIDERS",
 ]
 
 logger = logging.getLogger("ai_engine")
@@ -97,10 +103,6 @@ class LLMOutputError(LLMError):
 # --------------------------------------------------------------------------- config
 
 
-def _model_name() -> str:
-    return os.environ.get("LLM_MODEL", "").strip() or DEFAULT_MODEL
-
-
 def _timeout_seconds() -> float:
     raw = os.environ.get("LLM_TIMEOUT_SECONDS", "").strip()
     if not raw:
@@ -121,40 +123,205 @@ def _effort() -> str:
     return raw
 
 
+# --------------------------------------------------------------------------- providers
+
+# OpenAI-compatible providers: name -> (base URL, key env vars, default model).
+# Every default model can be overridden with model=, <PROVIDER>_MODEL or LLM_MODEL.
+_OPENAI_COMPATIBLE: dict[str, tuple[str | None, tuple[str, ...], str]] = {
+    "openai": (None, ("OPENAI_API_KEY",), "gpt-5-mini"),
+    "gemini": (
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        "gemini-2.5-flash",
+    ),
+    "groq": ("https://api.groq.com/openai/v1", ("GROQ_API_KEY",), "llama-3.3-70b-versatile"),
+    "openrouter": ("https://openrouter.ai/api/v1", ("OPENROUTER_API_KEY",), "openrouter/auto"),
+    "deepseek": ("https://api.deepseek.com", ("DEEPSEEK_API_KEY",), "deepseek-chat"),
+    "mistral": ("https://api.mistral.ai/v1", ("MISTRAL_API_KEY",), "mistral-large-latest"),
+    "xai": ("https://api.x.ai/v1", ("XAI_API_KEY",), "grok-4"),
+    "together": (
+        "https://api.together.xyz/v1",
+        ("TOGETHER_API_KEY",),
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    ),
+    "ollama": ("http://localhost:11434/v1", ("OLLAMA_API_KEY",), "llama3.1"),
+    "custom": (None, ("LLM_API_KEY",), ""),  # any OpenAI-compatible server: set LLM_BASE_URL + LLM_MODEL
+}
+PROVIDERS: tuple[str, ...] = ("anthropic",) + tuple(_OPENAI_COMPATIBLE)
+_ANTHROPIC_KEY_ENV = ("ANTHROPIC_API_KEY",)
+# Key prefixes used to pick a provider when the caller passes a key but no provider.
+_KEY_PREFIXES = (
+    ("sk-ant-", "anthropic"),
+    ("sk-or-", "openrouter"),
+    ("gsk_", "groq"),
+    ("xai-", "xai"),
+    ("AIza", "gemini"),
+    ("AQ.", "gemini"),
+    ("sk-", "openai"),
+)
+
+_dotenv_loaded = False
+
+
+def _load_dotenv() -> None:
+    """Load KEY=VALUE lines from a .env next to this file, once, without overriding the environment.
+
+    Runs lazily on the first LLM call, never at import time. Disable with AI_ENGINE_DOTENV=0.
+    """
+    global _dotenv_loaded
+    if _dotenv_loaded:
+        return
+    _dotenv_loaded = True
+    if os.environ.get("AI_ENGINE_DOTENV", "1") == "0":
+        return
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip().removeprefix("export ").strip()
+        value = value.strip().strip('"').strip("'")
+        if name and value and name not in os.environ:
+            os.environ[name] = value
+
+
+def _key_env_vars(provider: str) -> tuple[str, ...]:
+    return _ANTHROPIC_KEY_ENV if provider == "anthropic" else _OPENAI_COMPATIBLE[provider][1]
+
+
+def _env_key(provider: str) -> str:
+    for name in _key_env_vars(provider):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _env_provider() -> str:
+    """Provider when the caller names none: LLM_PROVIDER, else the first provider with a key set."""
+    _load_dotenv()
+    configured = os.environ.get("LLM_PROVIDER", "").strip().lower()
+    if configured:
+        if configured not in PROVIDERS:
+            raise LLMConfigError(f"LLM_PROVIDER must be one of {', '.join(PROVIDERS)}")
+        return configured
+    for name in PROVIDERS:
+        if name not in ("ollama", "custom") and _env_key(name):
+            return name
+    return "anthropic"
+
+
+def _check_llm_args(api_key: Any, provider: Any = None, model: Any = None) -> None:
+    """Reject malformed caller-supplied LLM options before any work is done."""
+    if api_key is not None and (not isinstance(api_key, str) or not api_key.strip()):
+        raise ValueError("api_key must be a non-empty string or None")
+    if provider is not None:
+        if not isinstance(provider, str) or provider.strip().lower() not in PROVIDERS:
+            raise ValueError(f"provider must be one of {', '.join(PROVIDERS)}")
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise ValueError("model must be a non-empty string or None")
+
+
+_check_api_key = _check_llm_args  # backward-compatible name
+
+
+def _resolve_provider(provider: str | None = None, api_key: str | None = None) -> str:
+    if provider is not None:
+        return provider.strip().lower()
+    if api_key:
+        for prefix, name in _KEY_PREFIXES:
+            if api_key.strip().startswith(prefix):
+                return name
+    return _env_provider()
+
+
+def _resolve_model(provider: str, model: str | None = None) -> str:
+    if model:
+        return model.strip()
+    _load_dotenv()
+    specific = os.environ.get(f"{provider.upper()}_MODEL", "").strip()
+    if specific:
+        return specific
+    generic = os.environ.get("LLM_MODEL", "").strip()
+    if generic and (provider == _env_provider() or provider == "custom"):
+        return generic
+    if provider == "anthropic":
+        return DEFAULT_MODEL
+    default = _OPENAI_COMPATIBLE[provider][2]
+    if not default:
+        raise LLMConfigError("provider 'custom' needs a model: pass model= or set LLM_MODEL")
+    return default
+
+
+def _resolve_base_url(provider: str) -> str | None:
+    """Base URLs come only from server config, never from the caller (no SSRF via requests)."""
+    if provider == "anthropic":
+        return None
+    override = os.environ.get(f"{provider.upper()}_BASE_URL", "").strip()
+    if provider == "custom":
+        override = override or os.environ.get("LLM_BASE_URL", "").strip()
+        if not override:
+            raise LLMConfigError("provider 'custom' needs LLM_BASE_URL")
+    return override or _OPENAI_COMPATIBLE[provider][0]
+
+
+def _model_name() -> str:
+    """Model used when the caller passes no provider or model (for display)."""
+    try:
+        return _resolve_model(_env_provider())
+    except LLMConfigError:
+        return DEFAULT_MODEL
+
+
 # --------------------------------------------------------------------------- client
 
 _MAX_CACHED_CLIENTS = 64
-_clients: OrderedDict[tuple[str, float], anthropic.Anthropic] = OrderedDict()
+_clients: OrderedDict[tuple, Any] = OrderedDict()
 _client_lock = threading.Lock()
 
 
-def _check_api_key(api_key: Any) -> None:
-    """Reject a malformed caller-supplied key before any work is done."""
-    if api_key is not None and (not isinstance(api_key, str) or not api_key.strip()):
-        raise ValueError("api_key must be a non-empty string or None")
+def _get_client(api_key: str | None = None, provider: str | None = None) -> Any:
+    """Lazy, cached SDK client for the caller's key, or the provider's key from the environment.
 
-
-def _get_client(api_key: str | None = None) -> anthropic.Anthropic:
-    """Lazy, cached SDK client for the caller's key (or ANTHROPIC_API_KEY).
-
-    The key is read at call time, never at import time. One client is kept per
-    (key, timeout), keyed by a hash so plaintext keys are not used as dict keys;
-    the least recently used client is dropped beyond _MAX_CACHED_CLIENTS.
+    Keys are read at call time, never at import time. One client is kept per
+    (provider, base URL, key hash, timeout); plaintext keys are never used as dict keys,
+    and the least recently used client is dropped beyond _MAX_CACHED_CLIENTS.
     """
-    key = (api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")).strip()
+    _load_dotenv()
+    name = _resolve_provider(provider, api_key)
+    key = (api_key if api_key is not None else _env_key(name)).strip()
+    if not key and name == "ollama":
+        key = "ollama"  # local server, no key needed
     if not key:
-        raise LLMConfigError("no API key: pass api_key= or set ANTHROPIC_API_KEY")
+        envs = " or ".join(_key_env_vars(name))
+        raise LLMConfigError(f"no API key for provider '{name}': pass api_key= or set {envs}")
     timeout = _timeout_seconds()
-    cache_key = (hashlib.sha256(key.encode()).hexdigest(), timeout)
+    base_url = _resolve_base_url(name)
+    cache_key = (name, base_url, hashlib.sha256(key.encode()).hexdigest(), timeout)
     with _client_lock:
         client = _clients.get(cache_key)
-        if client is None:
-            client = anthropic.Anthropic(api_key=key, timeout=timeout, max_retries=SDK_MAX_RETRIES)
-            _clients[cache_key] = client
-            while len(_clients) > _MAX_CACHED_CLIENTS:
-                _clients.popitem(last=False)
-        else:
+        if client is not None:
             _clients.move_to_end(cache_key)
+            return client
+        if name == "anthropic":
+            client = anthropic.Anthropic(api_key=key, timeout=timeout, max_retries=SDK_MAX_RETRIES)
+        else:
+            try:
+                import openai
+            except ImportError:
+                raise LLMConfigError(f"provider '{name}' needs the openai package: pip install openai") from None
+            client = openai.OpenAI(
+                api_key=key, base_url=base_url, timeout=timeout, max_retries=SDK_MAX_RETRIES
+            )
+        _clients[cache_key] = client
+        while len(_clients) > _MAX_CACHED_CLIENTS:
+            _clients.popitem(last=False)
         return client
 
 
@@ -167,14 +334,26 @@ def _provider_complete(
     max_tokens: int,
     *,
     api_key: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> dict | str:
-    """The only function that touches the provider SDK. Swap this to change provider.
+    """The only function that touches provider SDKs. Returns the raw response text."""
+    name = _resolve_provider(provider, api_key)
+    model_name = _resolve_model(name, model)
+    client = _get_client(api_key, name)
+    if name == "anthropic":
+        return _anthropic_complete(client, model_name, prompt, system_message, json_mode, schema, max_tokens)
+    return _openai_compatible_complete(
+        client, name, model_name, prompt, system_message, json_mode, schema, temperature, max_tokens
+    )
 
-    Returns the raw text of the response (a JSON string in JSON mode). `temperature` is
-    accepted for interface compatibility but not sent: current Claude models reject
-    sampling parameters, and structured outputs already constrain the JSON shape.
-    """
-    client = _get_client(api_key)
+
+def _anthropic_complete(
+    client: Any, model_name: str, prompt: str, system_message: str, json_mode: bool,
+    schema: dict | None, max_tokens: int,
+) -> str:
+    """Claude via the Messages API. `temperature` is not sent: current Claude models
+    reject sampling parameters, and structured outputs already constrain the JSON."""
     system = system_message
     output_config: dict[str, Any] = {"effort": _effort()}
     if json_mode:
@@ -185,7 +364,7 @@ def _provider_complete(
                 "Respond with a single JSON object only: no prose, no markdown fences."
             )
     kwargs: dict[str, Any] = {
-        "model": _model_name(),
+        "model": model_name,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
         "output_config": output_config,
@@ -202,7 +381,7 @@ def _provider_complete(
     except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
         raise LLMConfigError(f"the API key was rejected by the provider ({type(exc).__name__})") from exc
     except anthropic.NotFoundError as exc:
-        raise LLMConfigError(f"model '{_model_name()}' not found") from exc
+        raise LLMConfigError(f"model '{model_name}' not found") from exc
     except anthropic.APIStatusError as exc:
         raise LLMError(f"provider error: HTTP {exc.status_code} ({type(exc).__name__})") from exc
     except anthropic.AnthropicError as exc:
@@ -216,6 +395,88 @@ def _provider_complete(
         getattr(block, "text", "") for block in message.content if block.type == "text"
     )
     if not text.strip():
+        raise LLMOutputError("model returned no text")
+    return text
+
+
+def _openai_compatible_complete(
+    client: Any, provider: str, model_name: str, prompt: str, system_message: str,
+    json_mode: bool, schema: dict | None, temperature: float, max_tokens: int,
+) -> str:
+    """Any OpenAI-compatible chat-completions API (OpenAI, Gemini, Groq, OpenRouter, ...).
+
+    Starts with strict JSON-schema output and degrades parameter by parameter when a
+    provider or model rejects one (temperature, max_tokens, json_schema, json_object).
+    The JSON hardening and pydantic validation downstream cover the weaker modes.
+    """
+    import openai
+
+    system = system_message
+    if json_mode:
+        hint = "Respond with a single JSON object only: no prose, no markdown fences."
+        if schema:
+            hint += " It must match this JSON Schema:\n" + json.dumps(schema)
+        system = (system + "\n\n" if system else "") + hint
+    messages: list[dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    kwargs: dict[str, Any] = {"model": model_name, "messages": messages, "temperature": temperature}
+    # OpenAI's own API wants max_completion_tokens (reasoning models reject max_tokens).
+    kwargs["max_completion_tokens" if provider == "openai" else "max_tokens"] = max_tokens
+    if json_mode:
+        kwargs["response_format"] = (
+            {"type": "json_schema", "json_schema": {"name": "result", "schema": schema, "strict": True}}
+            if schema
+            else {"type": "json_object"}
+        )
+
+    response = None
+    try:
+        for _ in range(5):
+            try:
+                response = client.chat.completions.create(**kwargs)
+                break
+            except openai.BadRequestError as exc:
+                detail = str(exc).lower()
+                if "temperature" in kwargs and "temperature" in detail:
+                    kwargs.pop("temperature")
+                elif "max_tokens" in kwargs and "max_tokens" in detail:
+                    kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+                elif "max_completion_tokens" in kwargs and "max_completion_tokens" in detail:
+                    kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+                elif "response_format" in kwargs and any(w in detail for w in ("response_format", "json", "schema")):
+                    if kwargs["response_format"]["type"] == "json_schema":
+                        kwargs["response_format"] = {"type": "json_object"}
+                    else:
+                        kwargs.pop("response_format")
+                else:
+                    raise
+                logger.info("provider %s rejected a parameter; retrying with a simpler request", provider)
+    except (openai.AuthenticationError, openai.PermissionDeniedError) as exc:
+        raise LLMConfigError(f"the API key was rejected by {provider} ({type(exc).__name__})") from exc
+    except openai.NotFoundError as exc:
+        raise LLMConfigError(f"model '{model_name}' not found at {provider}") from exc
+    except openai.APIStatusError as exc:
+        raise LLMError(f"{provider} error: HTTP {exc.status_code} ({type(exc).__name__})") from exc
+    except openai.OpenAIError as exc:
+        raise LLMError(f"{provider} error: {type(exc).__name__}") from exc
+    if response is None:
+        raise LLMError(f"{provider} rejected the request parameters")
+
+    if not response.choices:
+        raise LLMOutputError("model returned no choices")
+    choice = response.choices[0]
+    message = choice.message
+    if getattr(message, "refusal", None):
+        raise LLMOutputError("model declined the request")
+    if choice.finish_reason == "length":
+        raise LLMOutputError("model output was truncated at max_tokens")
+    if choice.finish_reason == "content_filter":
+        raise LLMOutputError("model output was blocked by a content filter")
+    text = message.content or ""
+    if not isinstance(text, str) or not text.strip():
         raise LLMOutputError("model returned no text")
     return text
 
@@ -271,10 +532,14 @@ def call_llm(
     temperature: float = 0.0,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     api_key: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> dict | str:
     """Send one prompt to the LLM. JSON mode returns a dict; text mode returns a str.
 
-    `api_key` overrides ANTHROPIC_API_KEY for this call (bring your own key).
+    Bring your own key and model: `api_key`, `provider` (see PROVIDERS) and `model`
+    override the environment for this call. With a key but no provider, the provider
+    is detected from the key prefix.
     """
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt must be a non-empty string")
@@ -282,14 +547,14 @@ def call_llm(
         raise ValueError("system_message must be a string")
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         raise ValueError("max_tokens must be a positive integer")
-    _check_api_key(api_key)
+    _check_llm_args(api_key, provider, model)
 
     last_error: LLMOutputError | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             raw = _provider_complete(
                 prompt, system_message, json_mode, schema, temperature, max_tokens,
-                api_key=api_key,
+                api_key=api_key, provider=provider, model=model,
             )
             if json_mode:
                 return _coerce_json_object(raw)
@@ -486,24 +751,30 @@ def _validate_analysis_inputs(regulation_text: Any, state: Any) -> str:
 
 
 def analyze_compliance_gap(
-    regulation_text: str, current_company_state_dict: dict, *, api_key: str | None = None
+    regulation_text: str,
+    current_company_state_dict: dict,
+    *,
+    api_key: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> list[dict]:
     """Compare a regulation against the company's current state and list the gaps.
 
     Returns anomaly dicts sorted most-severe first, with ids ANOM-001, ANOM-002, ...
-    An empty list means no gaps were found. `api_key` lets the end user supply their own
-    Anthropic key (default: ANTHROPIC_API_KEY). Raises ValueError on bad input and
+    An empty list means no gaps were found. `api_key`, `provider` and `model` let the end
+    user run on their own key and model with any supported provider (default: environment). Raises ValueError on bad input and
     LLMError (or a subclass) when the model cannot produce a valid result.
     """
     state_json = _validate_analysis_inputs(regulation_text, current_company_state_dict)
-    _check_api_key(api_key)
+    _check_llm_args(api_key, provider, model)
     prompt = build_analysis_prompt(regulation_text, state_json)
 
     # call_llm already retries unusable output (and its LLMOutputError propagates), so
     # this loop only re-asks when the JSON parses but fails schema validation.
     for attempt in range(1, MAX_ATTEMPTS + 1):
         payload = call_llm(
-            prompt, ANALYSIS_SYSTEM_PROMPT, json_mode=True, schema=ANALYSIS_SCHEMA, api_key=api_key
+            prompt, ANALYSIS_SYSTEM_PROMPT, json_mode=True, schema=ANALYSIS_SCHEMA,
+            api_key=api_key, provider=provider, model=model,
         )
         try:
             parsed = _AnalysisPayload.model_validate(payload)
@@ -742,33 +1013,43 @@ def _resolve_generated_at(generated_at: Any) -> datetime:
 
 
 def generate_audit_trail(
-    anomalies: list[dict], generated_at: datetime | None = None, *, api_key: str | None = None
+    anomalies: list[dict],
+    generated_at: datetime | None = None,
+    *,
+    api_key: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> str:
     """Turn anomalies into a formal Markdown compliance audit log.
 
     Always returns a Markdown string that follows the required structure. An empty list
     produces a deterministic "no gaps" log without calling the LLM. If the model's output
-    fails validation twice, a deterministic renderer is used instead. `api_key` lets the end
-    user supply their own Anthropic key (default: ANTHROPIC_API_KEY). Raises ValueError on
+    fails validation twice, a deterministic renderer is used instead. `api_key`, `provider`
+    and `model` select the user's own key and model (default: environment). Raises ValueError on
     bad input and LLMError if the provider cannot be reached.
     """
     items = _normalize_audit_items(anomalies)
-    _check_api_key(api_key)
+    _check_llm_args(api_key, provider, model)
     when = _resolve_generated_at(generated_at)
     iso = when.strftime("%Y-%m-%dT%H:%M:%SZ")
     report_id = "AUD-" + when.strftime("%Y%m%dT%H%M%SZ")
-    model = _model_name()
+    try:
+        model_label = _resolve_model(_resolve_provider(provider, api_key), model)
+    except LLMConfigError:
+        model_label = model or _model_name()
 
     if not items:
-        return _render_no_gaps(iso, report_id, model)
+        return _render_no_gaps(iso, report_id, model_label)
 
     payload = [{k: r[k] for k in OUTPUT_KEYS} for r in items]
     prompt = build_audit_prompt(
-        json.dumps(payload, indent=2, ensure_ascii=False), iso, report_id, model
+        json.dumps(payload, indent=2, ensure_ascii=False), iso, report_id, model_label
     )
     for attempt in range(1, AUDIT_ATTEMPTS + 1):
         try:
-            text = call_llm(prompt, AUDIT_SYSTEM_PROMPT, json_mode=False, api_key=api_key)
+            text = call_llm(
+                prompt, AUDIT_SYSTEM_PROMPT, json_mode=False, api_key=api_key, provider=provider, model=model
+            )
         except LLMOutputError as exc:
             logger.warning("generate_audit_trail attempt %d/%d: %s", attempt, AUDIT_ATTEMPTS, exc)
             break  # call_llm already retried; go straight to the fallback
@@ -778,7 +1059,7 @@ def generate_audit_trail(
         logger.warning("generate_audit_trail attempt %d/%d: output failed validation", attempt, AUDIT_ATTEMPTS)
 
     logger.warning("generate_audit_trail: using deterministic fallback renderer")
-    return _render_audit_fallback(items, iso, report_id, model)
+    return _render_audit_fallback(items, iso, report_id, model_label)
 
 
 # --------------------------------------------------------------------------- smoke test

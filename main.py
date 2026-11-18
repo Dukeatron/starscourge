@@ -1,17 +1,20 @@
 """FastAPI routes connecting the UI, the mock company state and the AI compliance engine.
 
 Run:  uvicorn main:app --reload
-Each request can carry the user's own Anthropic key in the X-Anthropic-Api-Key header;
-without it the server's ANTHROPIC_API_KEY is used. The key is never logged or stored.
+Bring your own model: each request can carry the user's key in X-LLM-Api-Key (or the
+older X-Anthropic-Api-Key), plus optional X-LLM-Provider and X-LLM-Model headers. With a
+key but no provider, the provider is detected from the key prefix. Without a key the
+server's environment is used. Keys are never logged or stored. Base URLs are server
+config only, so callers cannot point the server at arbitrary hosts.
 """
 
 import logging
 from typing import Any, Callable, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from ai_engine import LLMConfigError, LLMError, analyze_compliance_gap, generate_audit_trail
+from ai_engine import PROVIDERS, LLMConfigError, LLMError, analyze_compliance_gap, generate_audit_trail
 from mock_db import get_compliance_state
 from models import AuditGenerationRequest, RegulationAnalysisRequest
 
@@ -27,7 +30,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY_HEADER = "X-Anthropic-Api-Key"
+API_KEY_HEADER = "X-LLM-Api-Key"
+LEGACY_KEY_HEADER = "X-Anthropic-Api-Key"
+PROVIDER_HEADER = "X-LLM-Provider"
+MODEL_HEADER = "X-LLM-Model"
 
 
 def _call_engine(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -41,7 +47,7 @@ def _call_engine(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any
             status_code=401,
             detail={
                 "error": "LLM_AUTH",
-                "message": f"{exc}. Send your Anthropic key in the {API_KEY_HEADER} header.",
+                "message": f"{exc}. Send your key in the {API_KEY_HEADER} header (optionally {PROVIDER_HEADER} and {MODEL_HEADER}).",
             },
         )
     except LLMError as exc:
@@ -49,15 +55,36 @@ def _call_engine(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any
         raise HTTPException(status_code=502, detail={"error": "LLM_UNAVAILABLE", "message": str(exc)})
 
 
-def _api_key(header_value: Optional[str]) -> Optional[str]:
+def _clean(header_value: Optional[str]) -> Optional[str]:
     if header_value is None or not header_value.strip():
         return None
     return header_value.strip()
 
 
+def llm_options(
+    x_llm_api_key: Optional[str] = Header(None, alias=API_KEY_HEADER),
+    x_anthropic_api_key: Optional[str] = Header(None, alias=LEGACY_KEY_HEADER),
+    x_llm_provider: Optional[str] = Header(None, alias=PROVIDER_HEADER),
+    x_llm_model: Optional[str] = Header(None, alias=MODEL_HEADER),
+) -> dict:
+    """The caller's LLM choice from request headers, as engine keyword arguments."""
+    key = _clean(x_llm_api_key)
+    provider = _clean(x_llm_provider)
+    if key is None and _clean(x_anthropic_api_key):
+        key = _clean(x_anthropic_api_key)
+        provider = provider or "anthropic"
+    return {"api_key": key, "provider": provider.lower() if provider else None, "model": _clean(x_llm_model)}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/providers")
+def providers():
+    """Providers a caller can choose with the X-LLM-Provider header."""
+    return {"providers": list(PROVIDERS)}
 
 
 @app.get("/api/system-state")
@@ -67,31 +94,22 @@ def system_state():
 
 
 @app.post("/api/analyze-regulation")
-def analyze_regulation(
-    request: RegulationAnalysisRequest,
-    x_anthropic_api_key: Optional[str] = Header(None, alias=API_KEY_HEADER),
-):
+def analyze_regulation(request: RegulationAnalysisRequest, llm: dict = Depends(llm_options)):
     """Analyze regulation text against the company profile. Returns the list of anomalies."""
     state = request.company_state if request.company_state is not None else get_compliance_state()
-    return _call_engine(
-        analyze_compliance_gap, request.text, state, api_key=_api_key(x_anthropic_api_key)
-    )
+    return _call_engine(analyze_compliance_gap, request.text, state, **llm)
 
 
 @app.post("/api/generate-audit")
-def generate_audit_report(
-    request: AuditGenerationRequest,
-    x_anthropic_api_key: Optional[str] = Header(None, alias=API_KEY_HEADER),
-):
+def generate_audit_report(request: AuditGenerationRequest, llm: dict = Depends(llm_options)):
     """Generate the Markdown audit log.
 
     Pass the `anomalies` returned by /api/analyze-regulation to avoid a second analysis;
     otherwise `text` is analyzed first. Returns {"anomalies": [...], "markdown": "..."}.
     """
-    key = _api_key(x_anthropic_api_key)
     anomalies = request.anomalies
     if anomalies is None:
         state = request.company_state if request.company_state is not None else get_compliance_state()
-        anomalies = _call_engine(analyze_compliance_gap, request.text, state, api_key=key)
-    markdown = _call_engine(generate_audit_trail, anomalies, api_key=key)
+        anomalies = _call_engine(analyze_compliance_gap, request.text, state, **llm)
+    markdown = _call_engine(generate_audit_trail, anomalies, **llm)
     return {"anomalies": anomalies, "markdown": markdown}

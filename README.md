@@ -133,7 +133,11 @@ Paste in a new regulation and a JSON snapshot of how the company is set up today
   - **Dates set by Python:** all timestamps come from Python in UTC. The audit log is rejected if the model writes any date or time that isn't in the input.
   - **Fallback renderer:** if the model's log fails validation twice, a deterministic renderer produces a valid log anyway.
   - **Prompt-injection defense:** regulation and company text are treated as untrusted data.
-- **Bring your own key:** every function takes an optional `api_key=`, so each user can run the engine on their own Anthropic key. Without it, the engine uses `ANTHROPIC_API_KEY`.
+- **Any model, your own key:** every function takes optional `api_key=`, `provider=` and `model=`.
+  - Claude uses the native API.
+  - Every other provider goes through one OpenAI-compatible adapter: OpenAI, Gemini, Groq, OpenRouter, DeepSeek, Mistral, xAI, Together, local Ollama, or any custom OpenAI-compatible server.
+  - Pass only a key and the provider is detected from its prefix.
+  - If a model rejects a parameter (`temperature`, `max_tokens`, strict JSON schema), the request falls back step by step. The JSON repair and schema validation still run afterwards.
 
 ### Setup and run
 
@@ -142,7 +146,7 @@ Requires Python 3.10+.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-export ANTHROPIC_API_KEY=...          # or pass api_key= per call
+cp .env.example .env                  # add any one provider key, or pass api_key= per call
 python ai_engine.py                   # smoke test: 30-day vs 90-day retention example
 pytest -m "not live"                  # offline suite, no key or network needed
 pytest -m live                        # real API: retention gap, compliant state, prompt injection, 20x reliability loop
@@ -150,8 +154,10 @@ pytest -m live                        # real API: retention gap, compliant state
 
 | Env var | Default | Notes |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | none | Required unless the caller passes `api_key=`. Read at call time and never logged. |
-| `LLM_MODEL` | `claude-sonnet-5-5` | |
+| `LLM_PROVIDER` | first provider with a key set | `anthropic`, `openai`, `gemini`, `groq`, `openrouter`, `deepseek`, `mistral`, `xai`, `together`, `ollama` or `custom` |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, … | none | One per provider. Put them in a gitignored `.env` (see `.env.example`). Read at call time and never logged. |
+| `LLM_MODEL` / `<PROVIDER>_MODEL` | `claude-sonnet-5-5`, `gpt-5-mini`, `gemini-2.5-flash`, … | Override the default model. |
+| `LLM_BASE_URL`, `LLM_API_KEY` | none | For `LLM_PROVIDER=custom` (any OpenAI-compatible server). |
 | `LLM_TIMEOUT_SECONDS` | `60` | Per-read timeout. Requests are streamed. |
 | `LLM_EFFORT` | `medium` | `low` to `max`. |
 
@@ -168,7 +174,7 @@ uvicorn main:app --reload          # http://127.0.0.1:8000/docs
 | POST | `/api/analyze-regulation` | `{"text": "...", "company_state": {...}?}` | list of anomalies |
 | POST | `/api/generate-audit` | `{"anomalies": [...]}` or `{"text": "...", "company_state": {...}?}` | `{"anomalies": [...], "markdown": "..."}` |
 
-- Send the user's own key in the optional `X-Anthropic-Api-Key` header.
+- **Your own key:** send it in the optional `X-LLM-Api-Key` header. `X-LLM-Provider` and `X-LLM-Model` are optional too, and `GET /api/providers` lists the providers. The older `X-Anthropic-Api-Key` header still works.
 - `company_state` defaults to the mock profile.
 - Errors return a `detail.error` code:
   - **422:** `INVALID_INPUT`, for bad input.
