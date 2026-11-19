@@ -624,32 +624,10 @@ function toJsSpan(text, span){
   if (!(s >= 0 && e > s && e <= text.length)) return null;
   return {start:s, end:e};
 }
-/* Clause markers at the start of a line: "Section 4.1" / "Article 5" / "§ 3", or "(i)", "(iv)",
-   "(a)", "(12)" (top level), or "a." / "b)" (sub-items, e.g. CERT-In (v) a.–g.). Mid-sentence
-   cross-references such as "section 70B of the IT Act" are not clause headings, so they are ignored. */
-const NAMED_RE = /^[ \t]*((?:Section|Article|§|Rule|Clause|Regulation|Direction)\s*\d+(?:\.\d+)*[a-z]?(?:\([a-z0-9]+\))*)/gim;
-const PAREN_RE = /^[ \t]*(\((?:[ivxlcdm]+|[a-z]|\d{1,3})\))(?=\s)/gim;
-const SUB_RE = /^[ \t]*([a-z])[.)](?=\s)/gim;
-function clauseMarkers(text){
-  const top = [...text.matchAll(NAMED_RE)].map(m => ({at:m.index, label:m[1].replace(/\s+/g, ' ')}))
-    .concat([...text.matchAll(PAREN_RE)].map(m => ({at:m.index, label:m[1]})))
-    .sort((a, b) => a.at - b.at);
-  // A blank line followed by an unnumbered paragraph ends the previous clause (empty label).
-  const breaks = [...text.matchAll(/\n[ \t]*\n(?=[ \t]*\S)/g)].map(m => ({at:m.index + m[0].length, label:''}))
-    .filter(b => !top.some(t => t.at === b.at));
-  top.push(...breaks); top.sort((a, b) => a.at - b.at);
-  const sub = [...text.matchAll(SUB_RE)].map(m => ({at:m.index, label:m[1] + '.'}));
-  return {top, sub};
-}
-let markersFor = null, markers = null;
-function lineOf(text, pos){
-  if (markersFor !== text){ markers = clauseMarkers(text); markersFor = text; }
-  const line = text.slice(0, pos).split('\n').length;
-  const top = markers.top.filter(m => m.at <= pos).pop();
-  const sub = markers.sub.filter(m => m.at <= pos && (!top || m.at > top.at)).pop();
-  const label = top ? top.label + (sub ? ` ${sub.label}` : '') : sub ? sub.label : '';
-  return label ? `${label} · line ${line}` : `line ${line}`;
-}
+const lineNo = (text, pos) => `line ${text.slice(0, pos).split('\n').length}`;
+/* Clause labels ("Section 4.1", "(v) a.", "Section 4.1 (12)") come from /api/coverage. Without
+   one, fall back to the line number of the span. */
+const clauseLabel = (cl, text, span) => cl?.label || (span ? lineNo(text, span.start) : '');
 const MATCH = {
   exact:{cls:'', label:() => `${ICON_CHECK}Verified · verbatim`, tip:'The model\'s quote was found word for word in the regulation.'},
   fragment:{cls:'partial', label:a => `◐ Partial quote · ${Math.round((a.excerpt_score ?? 0) * 100)}%`, tip:'Only part of the model\'s quote was found verbatim. The part shown is the part that was found.'},
@@ -822,7 +800,7 @@ function cardHtml(a, i){
   const badge = M ? `<span class="grounded ${M.cls}" title="${esc(M.tip)}">${M.label(a)}</span>` : '<span class="grounded unk" title="The server did not report how this quote was matched.">Match not reported</span>';
   const warn = mk === 'nearest' ? '<div class="warn">The model\'s own quote was not found in the text. This is the closest clause, so verify the citation before relying on it.</div>'
     : mk === 'none' ? '<div class="warn">No clause in the regulation resembles the model\'s quote. Treat this finding as unsupported.</div>' : '';
-  const loc = span ? [lineOf(S.analyzedText, span.start), `chars ${span.start.toLocaleString()}–${span.end.toLocaleString()}`] : [];
+  const loc = span ? [clauseLabel(clause, S.analyzedText, span), `chars ${span.start.toLocaleString()}–${span.end.toLocaleString()}`] : [];
   return `<article class="card sev-${esc(a.severity)}" id="card-${i}" data-idx="${i}" data-sev="${esc(a.severity)}" data-info="${info}" style="--sev:${sev};--i:${i}">
     <div class="card-hd"><div style="min-width:0;flex:1">
       <div class="row" style="gap:10px;align-items:baseline;flex-wrap:nowrap"><span class="id">${esc(a.id || `#${i + 1}`)}</span><h3>${esc(a.title)}</h3></div>
@@ -897,7 +875,8 @@ function renderCoverage(){
         <div style="min-width:0"><div class="ctext">${esc(cl.text)}</div>
           <div class="cfoot"><span class="pill" style="color:${clauseColor(cl)};border-color:${clauseColor(cl)}">${esc(st.label)}</span>
             ${nf ? '<span class="nfnote">⚠ The model raised nothing here. Review by hand.</span>' : fids}
-            ${js ? `<span class="meta-txt">${esc(lineOf(S.analyzedText, js.start))}</span><button class="link" data-srcclause="${esc(cl.id)}">Show in source</button>` : ''}</div></div></div>`;
+            ${clauseLabel(cl, S.analyzedText, js) ? `<span class="meta-txt">${esc(clauseLabel(cl, S.analyzedText, js))}</span>` : ''}
+            ${js ? `<button class="link" data-srcclause="${esc(cl.id)}">Show in source</button>` : ''}</div></div></div>`;
     }).join('')}</div>`;
   animateNumbers(host);
   wireCommon(host);
@@ -1068,8 +1047,8 @@ function switchTab(name){
 function loadSample(){ $('reg').value = SAMPLE; onRegInput(); }
 function onRegInput(){
   const v = $('reg').value, n = v.length;
-  const clauses = n ? clauseMarkers(v).top.filter(m => m.label).length : 0;
-  $('chars').textContent = n ? `${n.toLocaleString()} chars${clauses ? ` · ${plural(clauses, 'numbered clause')}` : ''}` : 'No text yet';
+  const lines = n ? v.split('\n').filter(l => l.trim()).length : 0;
+  $('chars').textContent = n ? `${n.toLocaleString()} chars · ${plural(lines, 'line')}` : 'No text yet';
   $('clearReg').classList.toggle('hidden', !n);
   setPipeline();
 }
