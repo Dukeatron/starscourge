@@ -31,6 +31,7 @@ ISO = "2026-11-18T11:38:00Z"
 EXPECTED_KEYS = {
     "id", "title", "category", "severity", "gap_type", "regulation_requirement",
     "regulation_excerpt", "current_state", "gap_description", "recommended_remediation",
+    "state_fields", "excerpt_match", "excerpt_score", "excerpt_span",  # additive fields
 }
 
 
@@ -1044,6 +1045,71 @@ def test_dotenv_is_loaded_lazily_without_overriding(no_key, monkeypatch, tmp_pat
     assert os.environ["OPENAI_API_KEY"] == "from-env"
 
 
+# --------------------------------------------------------------------------- additive fields
+
+
+def test_schema_asks_for_state_fields():
+    item = ai_engine.ANALYSIS_SCHEMA["properties"]["anomalies"]["items"]
+    assert item["properties"]["state_fields"] == {"type": "array", "items": {"type": "string"}}
+    assert "state_fields" in item["required"]  # strict JSON-schema mode needs every property listed
+
+
+def test_state_fields_are_validated_against_real_keys(provider):
+    state = {"Data_Retention_Days": 30, "security": {"encryption": "AES-128"}, "dpo": False}
+    provider({"anomalies": [
+        make_anomaly(state_fields=["data_retention_days", "made_up_key", "security.encryption", 7]),
+        make_anomaly(title="Inferred", gap_description="g2", current_state="security.encryption = AES-128; dpo = false"),
+        make_anomaly(title="Malformed", gap_description="g3", state_fields={"not": "a list"}, current_state="none"),
+    ]})
+    by_title = {a["title"]: a for a in analyze_compliance_gap(REGULATION, state)}
+    assert by_title["Data retention period too short"]["state_fields"] == ["Data_Retention_Days", "security.encryption"]
+    assert by_title["Inferred"]["state_fields"] == ["security.encryption", "dpo"]  # state order, not "security"
+    assert by_title["Malformed"]["state_fields"] == []
+
+
+def test_findings_carry_excerpt_metadata(provider):
+    provider({"anomalies": [
+        make_anomaly(),
+        make_anomaly(title="Paraphrased", gap_description="g2", regulation_excerpt="appoint DPO officer entity"),
+        make_anomaly(title="Invented", gap_description="g3", regulation_excerpt="zebra quantum lattice"),
+    ]})
+    by_title = {a["title"]: a for a in analyze_compliance_gap(REGULATION, STATE)}
+    exact = by_title["Data retention period too short"]
+    assert exact["excerpt_match"] == "exact" and exact["excerpt_score"] == 1.0
+    start, end = exact["excerpt_span"]
+    assert REGULATION[start:end] == exact["regulation_excerpt"]
+    near = by_title["Paraphrased"]
+    assert near["excerpt_match"] == "nearest" and isinstance(near["excerpt_span"], list)
+    assert "Data Protection Officer" in near["regulation_excerpt"]
+    invented = by_title["Invented"]
+    assert invented["excerpt_match"] == "none" and invented["excerpt_span"] is None
+    assert invented["regulation_excerpt"] in REGULATION
+    assert all(isinstance(a["excerpt_score"], float) for a in by_title.values())
+
+
+def test_audit_report_says_who_wrote_the_log(provider, no_key):
+    anoms = anomalies_with_ids()
+    provider(good_markdown(anoms))
+    llm = ai_engine.generate_audit_report(anoms, generated_at=GENERATED_AT, api_key="sk-ant-x", model="claude-x")
+    assert (llm["renderer"], llm["model"]) == ("llm", "claude-x")
+    assert llm["markdown"] == generate_audit_trail(anoms, generated_at=GENERATED_AT, api_key="sk-ant-x", model="claude-x")
+
+    provider("not a valid log")
+    fallback = ai_engine.generate_audit_report(anoms, generated_at=GENERATED_AT, api_key="sk-ant-x", model="claude-x")
+    assert (fallback["renderer"], fallback["model"]) == ("deterministic", "claude-x")  # called, but its log was rejected
+
+    empty = ai_engine.generate_audit_report([], generated_at=GENERATED_AT)
+    assert (empty["renderer"], empty["model"]) == ("deterministic", None)  # no LLM called
+    assert set(empty) == {"markdown", "renderer", "model"}
+
+
+def test_audit_accepts_findings_with_the_additive_fields(provider):
+    provider(json.dumps({"anomalies": [make_anomaly()]}), "not a valid log")
+    found = analyze_compliance_gap(REGULATION, STATE)
+    md = generate_audit_trail(found, generated_at=GENERATED_AT)
+    assert "### ANOM-001" in md and "excerpt_span" not in md
+
+
 # --------------------------------------------------------------------------- HTML escaping
 
 _XSS = '<img src=x onerror="alert(1)">'
@@ -1108,7 +1174,8 @@ def _reference_closest_sentence(excerpt: str, regulation: str) -> str:
     import difflib
 
     norm_ex = ai_engine._normalized_with_map(excerpt)[0].strip().strip("\"'…. ")
-    sentences = [s.strip() for s in ai_engine._SENTENCE_SPLIT_RE.split(regulation) if len(s.strip()) >= 15]
+    # Candidates are the filtered clauses (headings and injection text excluded).
+    sentences = [c.text for c in ai_engine._RegulationIndex(regulation).clauses()]
     target = set(ai_engine._WORD_RE.findall(norm_ex))
     best, best_score = sentences[0], (-1.0, -1.0)
     for sentence in sentences:
@@ -1134,7 +1201,7 @@ def test_closest_sentence_fallback_matches_brute_force_reference():
     for _ in range(40):
         # "zzz" never occurs in the regulation, so this always takes the closest-sentence fallback.
         paraphrase = " ".join(rng.choice(vocab + ["qqq"]) for _ in range(rng.randint(0, 8))) + " zzz"
-        assert index.ground(paraphrase) == _reference_closest_sentence(paraphrase, regulation)
+        assert index.ground(paraphrase).text == _reference_closest_sentence(paraphrase, regulation)
 
 
 def test_normalization_handles_unicode_quotes_dashes_and_spaces():
@@ -1143,7 +1210,8 @@ def test_normalization_handles_unicode_quotes_dashes_and_spaces():
     assert norm == "the entity's \"dpo\" - appointed within 72 hours. ärzte"
     assert len(norm) == len(index) and all(text[i] for i in index)
     grounded = ai_engine._RegulationIndex(text).ground('the entity\'s "dpo" - appointed within 72 hours')
-    assert grounded == "The Entity’s “DPO” — appointed within  72 HOURS"
+    assert grounded.match == "exact" and text[slice(*grounded.span)] == grounded.text
+    assert grounded.text == "The Entity’s “DPO” — appointed within  72 HOURS"
 
 
 # --------------------------------------------------------------------------- live tests

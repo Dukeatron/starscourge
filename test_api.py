@@ -223,6 +223,32 @@ def test_api_key_is_not_echoed_in_errors(fake_provider):
     assert "sk-ant-secret" not in response.text
 
 
+# --------------------------------------------------------------------------- additive response fields
+
+
+def test_analyze_response_adds_grounding_and_state_fields(fake_provider):
+    fake_provider(json.dumps({"anomalies": [finding(state_fields=["data_retention_days"])]}))
+    [a] = client.post("/api/analyze-regulation", json={"text": REGULATION}).json()
+    assert {k: a[k] for k in finding()} == {**finding(), "regulation_excerpt": a["regulation_excerpt"]}  # old keys intact
+    assert a["state_fields"] == ["data_retention_days"]
+    assert a["excerpt_match"] == "exact" and a["excerpt_score"] == 1.0
+    start, end = a["excerpt_span"]
+    assert REGULATION[start:end] == a["regulation_excerpt"]
+
+
+def test_generate_audit_response_adds_renderer_and_model(fake_provider):
+    fake_provider("not a valid audit log")
+    anomalies = [{"id": "ANOM-001", **finding()}]
+    body = client.post(
+        "/api/generate-audit", json={"anomalies": anomalies}, headers={"X-LLM-Provider": "groq", "X-LLM-Model": "llama-x"}
+    ).json()
+    assert set(body) == {"anomalies", "markdown", "renderer", "model"}
+    assert (body["renderer"], body["model"]) == ("deterministic", "llama-x")
+
+    empty = client.post("/api/generate-audit", json={"anomalies": []}).json()
+    assert (empty["renderer"], empty["model"]) == ("deterministic", None)
+
+
 # --------------------------------------------------------------------------- offline demo mode
 
 
@@ -238,7 +264,7 @@ def test_demo_mode_runs_the_ui_sample_offline(fake_provider, monkeypatch):
     assert response.status_code == 200
     anomalies = response.json()
     assert [a["id"] for a in anomalies] == ["ANOM-001", "ANOM-002", "ANOM-003", "ANOM-004"]
-    assert all(set(a) == set(finding()) | {"id"} for a in anomalies)
+    assert all(set(a) == set(finding()) | {"id", "state_fields", "excerpt_match", "excerpt_score", "excerpt_span"} for a in anomalies)
     assert all(a["regulation_excerpt"] in demo_fixtures.UI_SAMPLE_REGULATION for a in anomalies)
 
     audit = client.post("/api/generate-audit", json={"anomalies": anomalies})

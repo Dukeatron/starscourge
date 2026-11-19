@@ -29,7 +29,6 @@ at import time, and keys are never logged:
 
 from __future__ import annotations
 
-import difflib
 import hashlib
 import json
 import logging
@@ -37,7 +36,6 @@ import os
 import re
 import threading
 import time
-import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Callable, Literal, NamedTuple, TypeVar
@@ -46,6 +44,7 @@ import anthropic
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 import demo_fixtures
+import grounding
 from prompts import (
     ANALYSIS_SCHEMA,
     ANALYSIS_SYSTEM_PROMPT,
@@ -64,6 +63,8 @@ __all__ = [
     "call_llm",
     "analyze_compliance_gap",
     "generate_audit_trail",
+    "generate_audit_report",
+    "build_coverage",
     "PROVIDERS",
 ]
 
@@ -88,7 +89,7 @@ DEFAULT_MAX_TOKENS = 16000  # room for adaptive thinking plus up to 25 findings
 MAX_REGULATION_CHARS = 100_000
 MAX_STATE_CHARS = 20_000
 MAX_TITLE_CHARS = 80
-MAX_EXCERPT_CHARS = 200
+MAX_EXCERPT_CHARS = grounding.MAX_EXCERPT_CHARS
 NOT_SPECIFIED = "Not specified in company state"
 
 # Server-side refusal fallback: if the model declines, the API re-runs the request on
@@ -96,7 +97,9 @@ NOT_SPECIFIED = "Not specified in company state"
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-OUTPUT_KEYS = ("id",) + ANOMALY_ITEM_FIELDS
+OUTPUT_KEYS = ("id",) + ANOMALY_ITEM_FIELDS  # the original contract; the audit prompt sends these
+# Additive per-finding fields (owner-approved): appended after OUTPUT_KEYS.
+ADDITIVE_FIELDS = ("state_fields", "excerpt_match", "excerpt_score", "excerpt_span")
 
 
 # --------------------------------------------------------------------------- errors
@@ -765,6 +768,18 @@ class _Anomaly(BaseModel):
     current_state: str
     gap_description: str
     recommended_remediation: str
+    # Optional: older or weaker models may omit it. Checked against the real keys later.
+    state_fields: list[str] = []
+
+    @field_validator("state_fields", mode="before")
+    @classmethod
+    def _string_list(cls, value: Any) -> list[str]:
+        """Lenient: a malformed state_fields never fails the finding, it just becomes []."""
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        return [v for v in value if isinstance(v, str) and v.strip()]
 
     @field_validator("category", "severity", "gap_type", mode="before")
     @classmethod
@@ -796,135 +811,57 @@ def _truncate(text: str, limit: int) -> str:
     return cut + "…"
 
 
-def _truncate_verbatim(text: str, limit: int) -> str:
-    """Shorten a quote by cutting it, never adding characters, so it stays verbatim."""
-    if len(text) <= limit:
-        return text
-    cut = text[:limit]
-    space = cut.rfind(" ")
-    if space > limit // 2:
-        cut = cut[:space]
-    return cut.rstrip(" ,;:")
+# Excerpt grounding lives in grounding.py; these aliases keep the engine's internal names.
+_truncate_verbatim = grounding.truncate_verbatim
+_normalized_with_map = grounding.normalized_with_map
+_RegulationIndex = grounding.RegulationIndex
+_SENTENCE_SPLIT_RE = grounding.SENTENCE_SPLIT_RE
+_WORD_RE = grounding.WORD_RE
 
 
-_QUOTE_MAP = str.maketrans({
-    "‘": "'", "’": "'", "“": '"', "”": '"',
-    "–": "-", "—": "-", " ": " ",
-})
+_MAX_STATE_PATH_DEPTH = 4
 
 
-def _normalize_char(ch: str) -> str:
-    """Casefold one character and unify quotes and dashes (ASCII skips the Unicode tables)."""
-    if ch.isascii():
-        return ch.lower()  # NFKC and _QUOTE_MAP leave ASCII unchanged, and casefold == lower
-    return unicodedata.normalize("NFKC", ch).translate(_QUOTE_MAP).casefold()
+def _state_key_paths(state: Any, prefix: str = "", depth: int = 0) -> list[str]:
+    """Every key of the company state, nested keys as dotted paths ("security.encryption")."""
+    if not isinstance(state, dict) or depth >= _MAX_STATE_PATH_DEPTH:
+        return []
+    paths: list[str] = []
+    for key, value in state.items():
+        path = f"{prefix}{key}"
+        paths.append(path)
+        paths += _state_key_paths(value, path + ".", depth + 1)
+    return paths
 
 
-def _normalized_with_map(text: str) -> tuple[str, list[int]]:
-    """Casefold, unify quotes/dashes, collapse whitespace; map each char back to the source."""
-    out: list[str] = []
-    index: list[int] = []
-    prev_space = True
-    for i, ch in enumerate(text):
-        for c in _normalize_char(ch):
-            if c.isspace():
-                if prev_space:
-                    continue
-                c, prev_space = " ", True
-            else:
-                prev_space = False
-            out.append(c)
-            index.append(i)
-    return "".join(out), index
+def _resolve_state_fields(claimed: list[str], current_state: str, known: list[str]) -> list[str]:
+    """The company-state keys a finding refers to, restricted to keys that really exist.
 
-
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.;!?])\s+(?=[A-Z0-9(\"'])|\n+")
-_WORD_RE = re.compile(r"[a-z0-9]{3,}")
-_ELLIPSIS_RE = re.compile(r"\.{3}|…")
-_MIN_FRAGMENT_CHARS = 20
-_MIN_SENTENCE_CHARS = 15
-
-
-class _RegulationIndex:
-    """A regulation prepared once, so many excerpts can be grounded against it cheaply.
-
-    The normalized text and its map back to source offsets are built up front. The
-    sentence list for the closest-sentence fallback is built only when an excerpt first
-    needs it, and is then shared by every later excerpt.
+    The model's `state_fields` are kept when they name a real key (matched ignoring case);
+    keys quoted in `current_state` (e.g. "data_retention_days = 30") are added, so the
+    field is filled even when the model leaves it out. Order: model's first, no repeats.
     """
-
-    def __init__(self, regulation: str) -> None:
-        self.text = regulation
-        self.norm, self.index = _normalized_with_map(regulation)
-        self._sentences: list[tuple[str, str, frozenset[str]]] | None = None
-
-    def find(self, norm_fragment: str) -> str | None:
-        """The exact source text of a normalized fragment, or None if the regulation lacks it."""
-        pos = self.norm.find(norm_fragment)
-        if pos == -1:
-            return None
-        end = self.index[min(pos + len(norm_fragment), len(self.index)) - 1] + 1
-        return self.text[self.index[pos] : end].strip()
-
-    def sentences(self) -> list[tuple[str, str, frozenset[str]]]:
-        """(source sentence, normalized sentence, word set) for each sentence of 15+ chars."""
-        if self._sentences is None:
-            self._sentences = []
-            for raw in _SENTENCE_SPLIT_RE.split(self.text):
-                sentence = raw.strip()
-                if len(sentence) >= _MIN_SENTENCE_CHARS:
-                    norm = _normalized_with_map(sentence)[0]
-                    self._sentences.append((sentence, norm, frozenset(_WORD_RE.findall(norm))))
-        return self._sentences
-
-    def closest_sentence(self, norm_excerpt: str) -> str:
-        """The sentence sharing the most words with the excerpt; difflib similarity breaks ties.
-
-        Same result as ranking every sentence by (word overlap, difflib ratio) and taking the
-        first best, but the quadratic difflib ratio is only computed for the sentences tied
-        on the best overlap.
-        """
-        sentences = self.sentences()
-        if not sentences:
-            return self.text.strip()
-        target = set(_WORD_RE.findall(norm_excerpt))
-        overlaps = [len(target & words) / len(target) if target else 0.0 for _, _, words in sentences]
-        top = max(overlaps)
-        best, best_ratio = "", -1.0
-        for (sentence, norm, _), overlap in zip(sentences, overlaps):
-            if overlap != top:
-                continue
-            ratio = difflib.SequenceMatcher(None, norm_excerpt, norm, autojunk=False).ratio()
-            if ratio > best_ratio:
-                best, best_ratio = sentence, ratio
-        return best
-
-    def ground(self, excerpt: str) -> str:
-        """Return a verbatim quote from the regulation that supports the finding.
-
-        The model's excerpt is located in the regulation (ignoring case, whitespace and
-        quote style) and replaced with the exact source text. If it cannot be found, the
-        closest regulation sentence is used instead, so every excerpt is a real quote.
-        """
-        norm_ex = _normalized_with_map(excerpt)[0].strip().strip("\"'…. ")
-        if norm_ex:
-            exact = self.find(norm_ex)
-            if exact is not None:
-                return _truncate_verbatim(exact, MAX_EXCERPT_CHARS)
-            # The model sometimes joins two fragments with "..."; ground the longest fragment.
-            fragments = sorted((f.strip() for f in _ELLIPSIS_RE.split(norm_ex)), key=len, reverse=True)
-            for fragment in fragments:
-                if len(fragment) >= _MIN_FRAGMENT_CHARS:
-                    exact = self.find(fragment)
-                    if exact is not None:
-                        return _truncate_verbatim(exact, MAX_EXCERPT_CHARS)
-        # Not quoted verbatim: use the regulation sentence that shares the most words with it.
-        return _truncate_verbatim(self.closest_sentence(norm_ex), MAX_EXCERPT_CHARS)
+    by_folded = {path.casefold(): path for path in known}
+    fields: list[str] = []
+    for name in claimed:
+        path = by_folded.get(name.strip().casefold())
+        if path and path not in fields:
+            fields.append(path)
+    for path in known:
+        if path not in fields and re.search(rf"(?<![\w.]){re.escape(path)}(?!\w|\.\w)", current_state):
+            fields.append(path)
+    return fields
 
 
-def _finalize_anomalies(items: list[_Anomaly], regulation_text: str) -> list[dict]:
-    """Dedupe, truncate titles, ground excerpts, sort by severity, cap at 25 and assign ids."""
+def _finalize_anomalies(items: list[_Anomaly], regulation_text: str, state: dict) -> list[dict]:
+    """Dedupe, truncate titles, ground excerpts, resolve state fields, sort by severity,
+    cap at 25 and assign ids.
+
+    Output keys: id, the ANOMALY_ITEM_FIELDS, then the additive state_fields,
+    excerpt_match, excerpt_score and excerpt_span (see grounding.py).
+    """
     regulation = _RegulationIndex(regulation_text)
+    known_paths = _state_key_paths(state)
     seen: set[tuple[str, str]] = set()
     cleaned: list[dict] = []
     for item in items:
@@ -934,7 +871,12 @@ def _finalize_anomalies(items: list[_Anomaly], regulation_text: str) -> list[dic
             continue
         seen.add(key)
         record["title"] = _truncate(record["title"], MAX_TITLE_CHARS)
-        record["regulation_excerpt"] = regulation.ground(record["regulation_excerpt"])
+        grounded = regulation.ground(record["regulation_excerpt"])
+        record["regulation_excerpt"] = grounded.text
+        record["excerpt_match"] = grounded.match
+        record["excerpt_score"] = grounded.score
+        record["excerpt_span"] = list(grounded.span) if grounded.span else None
+        record["state_fields"] = _resolve_state_fields(record["state_fields"], record["current_state"], known_paths)
         if record["gap_type"] == "insufficient_information" or not record["current_state"]:
             record["current_state"] = NOT_SPECIFIED
         cleaned.append(record)
@@ -942,9 +884,22 @@ def _finalize_anomalies(items: list[_Anomaly], regulation_text: str) -> list[dic
     cleaned.sort(key=lambda r: SEVERITY_RANK[r["severity"]])  # stable
     cleaned = cleaned[:MAX_ANOMALIES]
     return [
-        {"id": f"ANOM-{i:03d}", **{k: r[k] for k in ANOMALY_ITEM_FIELDS}}
+        {"id": f"ANOM-{i:03d}", **{k: r[k] for k in ANOMALY_ITEM_FIELDS + ADDITIVE_FIELDS}}
         for i, r in enumerate(cleaned, start=1)
     ]
+
+
+def build_coverage(regulation_text: str, anomalies: list[dict]) -> list[dict]:
+    """Clause-by-clause coverage of the regulation by grounded findings (see grounding.py).
+
+    Each item: {"id": "CL-001", "text": str, "span": [start, end],
+    "status": "gap" | "needs_info" | "not_flagged", "finding_ids": [str, ...]}.
+    """
+    if not isinstance(regulation_text, str) or not regulation_text.strip():
+        raise ValueError("regulation_text must be a non-empty string")
+    if not isinstance(anomalies, list):
+        raise ValueError("anomalies must be a list")
+    return grounding.build_coverage(regulation_text, anomalies)
 
 
 def _validate_analysis_inputs(regulation_text: Any, state: Any) -> str:
@@ -988,14 +943,15 @@ def analyze_compliance_gap(
     state_json = _validate_analysis_inputs(regulation_text, current_company_state_dict)
     _check_llm_args(api_key, provider, model)
     if _demo_mode():
-        return _finalize_anomalies(_demo_analysis(regulation_text, current_company_state_dict), regulation_text)
+        anomalies = _demo_analysis(regulation_text, current_company_state_dict)
+        return _finalize_anomalies(anomalies, regulation_text, current_company_state_dict)
     prompt = build_analysis_prompt(regulation_text, state_json)
     # Bad JSON and schema-invalid JSON share one budget of MAX_ATTEMPTS model calls.
     parsed = _complete_with_retries(
         prompt, ANALYSIS_SYSTEM_PROMPT, True, ANALYSIS_SCHEMA, 0.0, DEFAULT_MAX_TOKENS,
         _parse_analysis, api_key=api_key, provider=provider, model=model,
     )
-    return _finalize_anomalies(parsed.anomalies, regulation_text)
+    return _finalize_anomalies(parsed.anomalies, regulation_text, current_company_state_dict)
 
 
 def _demo_mode() -> bool:
@@ -1266,9 +1222,30 @@ def generate_audit_trail(
     deterministic renderer is used and no LLM is called. Raw HTML is never emitted: every
     "<" is escaped, so untrusted regulation or company text cannot inject markup.
     """
-    return _escape_html(
-        _audit_markdown(anomalies, generated_at, api_key=api_key, provider=provider, model=model)
+    report = generate_audit_report(anomalies, generated_at, api_key=api_key, provider=provider, model=model)
+    return report["markdown"]
+
+
+def generate_audit_report(
+    anomalies: list[dict],
+    generated_at: datetime | None = None,
+    *,
+    api_key: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> dict:
+    """generate_audit_trail plus how the log was produced.
+
+    Returns {"markdown": str, "renderer": "llm" | "deterministic", "model": str | None}.
+    `renderer` says who wrote the log: the LLM, or the deterministic renderer (no gaps,
+    demo mode, or the LLM's log failed validation). `model` is the LLM model that was
+    called for this log, or None when no LLM was called (no gaps, demo mode). Same inputs
+    and errors as generate_audit_trail.
+    """
+    markdown, renderer, model_used = _audit_markdown(
+        anomalies, generated_at, api_key=api_key, provider=provider, model=model
     )
+    return {"markdown": _escape_html(markdown), "renderer": renderer, "model": model_used}
 
 
 def _escape_html(markdown: str) -> str:
@@ -1284,8 +1261,8 @@ def _escape_html(markdown: str) -> str:
 def _audit_markdown(
     anomalies: Any, generated_at: datetime | None, *, api_key: str | None, provider: str | None,
     model: str | None,
-) -> str:
-    """generate_audit_trail before HTML escaping (LLM log, or a deterministic renderer)."""
+) -> tuple[str, str, str | None]:
+    """The audit log before HTML escaping, the renderer that wrote it, and the model called."""
     items = _normalize_audit_items(anomalies)
     _check_llm_args(api_key, provider, model)
     when = _resolve_generated_at(generated_at)
@@ -1294,12 +1271,12 @@ def _audit_markdown(
     if _demo_mode():  # offline: the deterministic renderer, labelled as such
         model_label = demo_fixtures.DEMO_MODEL_LABEL
         if not items:
-            return _render_no_gaps(iso, report_id, model_label)
-        return _render_audit_fallback(items, iso, report_id, model_label)
+            return _render_no_gaps(iso, report_id, model_label), "deterministic", None
+        return _render_audit_fallback(items, iso, report_id, model_label), "deterministic", None
     model_label = _model_label(api_key, provider, model)
 
     if not items:
-        return _render_no_gaps(iso, report_id, model_label)
+        return _render_no_gaps(iso, report_id, model_label), "deterministic", None
 
     payload = [{k: r[k] for k in OUTPUT_KEYS} for r in items]
     prompt = build_audit_prompt(
@@ -1315,11 +1292,11 @@ def _audit_markdown(
             break  # call_llm already retried; go straight to the fallback
         markdown = _strip_markdown_fences(str(text))
         if _audit_is_valid(markdown, iso, items):
-            return markdown
+            return markdown, "llm", model_label
         logger.warning("generate_audit_trail attempt %d/%d: output failed validation", attempt, AUDIT_ATTEMPTS)
 
     logger.warning("generate_audit_trail: using deterministic fallback renderer")
-    return _render_audit_fallback(items, iso, report_id, model_label)
+    return _render_audit_fallback(items, iso, report_id, model_label), "deterministic", model_label
 
 
 # --------------------------------------------------------------------------- smoke test

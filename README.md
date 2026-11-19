@@ -185,7 +185,7 @@ uvicorn main:app --reload          # http://127.0.0.1:8000/docs
 | GET | `/health` | none | `{"status": "ok"}` |
 | GET | `/api/system-state` | none | the mock company profile (`mock_db.py`) |
 | POST | `/api/analyze-regulation` | `{"text": "...", "company_state": {...}?}` | list of anomalies |
-| POST | `/api/generate-audit` | `{"anomalies": [...]}` or `{"text": "...", "company_state": {...}?}` | `{"anomalies": [...], "markdown": "..."}` |
+| POST | `/api/generate-audit` | `{"anomalies": [...]}` or `{"text": "...", "company_state": {...}?}` | `{"anomalies": [...], "markdown": "...", "renderer": "llm" \| "deterministic", "model": "..." \| null}` |
 
 - **Your own key:** send it in the optional `X-LLM-Api-Key` header. `X-LLM-Provider` and `X-LLM-Model` are optional too, and `GET /api/providers` lists the providers. The older `X-Anthropic-Api-Key` header still works.
 - `company_state` defaults to the mock profile.
@@ -205,9 +205,22 @@ anomalies = analyze_compliance_gap(regulation_text, company_state_dict, api_key=
 markdown  = generate_audit_trail(anomalies, api_key=user_key)                               # str
 ```
 
-- Each anomaly has exactly these keys: `id`, `title`, `category`, `severity`, `gap_type`, `regulation_requirement`, `regulation_excerpt`, `current_state`, `gap_description` and `recommended_remediation`. The list is sorted critical → low.
+- Each anomaly has these keys: `id`, `title`, `category`, `severity`, `gap_type`, `regulation_requirement`, `regulation_excerpt`, `current_state`, `gap_description` and `recommended_remediation`, plus the additive fields below. The list is sorted critical → low.
 - Both functions are synchronous. Call them from a plain `def` route, or use `run_in_threadpool`.
 - `ValueError` means bad input (HTTP 400/422).
 - `LLMConfigError` means a missing or rejected key (HTTP 401). Its subclass `LLMSetupError` means a server-side setup problem such as an unknown model (HTTP 500).
 - Any other `LLMError` means the provider failed (HTTP 502).
 - No other exception type escapes.
+
+**Additive fields** (existing keys are unchanged):
+
+| Where | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| each anomaly | `excerpt_match` | `"exact"` \| `"fragment"` \| `"nearest"` \| `"none"` | How `regulation_excerpt` was matched to the regulation. `exact`: the model's quote was found verbatim. `fragment`: one `...`-separated part of it was found. `nearest`: not found, so the clause sharing the most words is cited (an unverified citation). `none`: nothing resembles it. The closest clause text is kept so the excerpt is still a real quote, but the citation should not be trusted. |
+| each anomaly | `excerpt_score` | float, 0–1 | `exact`: 1.0. `fragment`: the fraction of the quote found. `nearest`/`none`: the fraction of the quote's words found in the clause (`none` is below 0.3). |
+| each anomaly | `excerpt_span` | `[start, end]` \| `null` | Character offsets into the submitted regulation text (Python string indices, end exclusive), so `text[start:end] == regulation_excerpt`. `null` when `excerpt_match` is `"none"`. |
+| each anomaly | `state_fields` | list of strings | The company-state keys the finding refers to, with nested keys as dotted paths (`"security.encryption"`). Only keys that really exist in the submitted state are kept. |
+| `/api/generate-audit` | `renderer` | `"llm"` \| `"deterministic"` | Who wrote `markdown`: the model, or the deterministic renderer (no gaps, demo mode, or the model's log failed validation). |
+| `/api/generate-audit` | `model` | string \| `null` | The model called for this log (even if its output was rejected), or `null` when no model was called. |
+
+Headings (e.g. "Section 4.1 Data Retention.") and text addressed to an AI ("ignore all previous instructions") are never used as `nearest` candidates or coverage clauses. `ai_engine.build_coverage(regulation_text, anomalies)` returns clause-by-clause coverage: `[{"id": "CL-001", "text": "...", "span": [start, end], "status": "gap" | "needs_info" | "not_flagged", "finding_ids": ["ANOM-001", ...]}]`. Findings map to clauses through `excerpt_span`. It is not served yet, because `/api/analyze-regulation` returns a bare list and a top-level field can't be added to it without breaking clients.

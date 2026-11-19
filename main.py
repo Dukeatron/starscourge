@@ -23,7 +23,7 @@ from ai_engine import (
     LLMError,
     LLMSetupError,
     analyze_compliance_gap,
-    generate_audit_trail,
+    generate_audit_report as engine_audit_report,
 )
 from mock_db import get_compliance_state
 from models import AuditGenerationRequest, RegulationAnalysisRequest
@@ -140,11 +140,13 @@ def generate_audit_report(request: AuditGenerationRequest, llm: dict = Depends(l
     """Generate the Markdown audit log.
 
     Pass the `anomalies` returned by /api/analyze-regulation to avoid a second analysis;
-    otherwise `text` is analyzed first. Returns {"anomalies": [...], "markdown": "..."}.
+    otherwise `text` is analyzed first. Returns {"anomalies": [...], "markdown": "...",
+    "renderer": "llm" | "deterministic", "model": str | null}.
     """
     anomalies = request.anomalies
     if anomalies is None:
         state = request.company_state if request.company_state is not None else get_compliance_state()
         anomalies = _call_engine(analyze_compliance_gap, request.text, state, **llm)
-    markdown = _call_engine(generate_audit_trail, anomalies, **llm)
-    return {"anomalies": anomalies, "markdown": markdown}
+    report = _call_engine(engine_audit_report, anomalies, **llm)
+    # "renderer" and "model" are additive: "llm" | "deterministic", and the model called (or null).
+    return {"anomalies": anomalies, "markdown": report["markdown"], "renderer": report["renderer"], "model": report["model"]}
