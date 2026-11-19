@@ -515,7 +515,7 @@ const STEP_AT = [0, 1600, 4200, 8000];
 const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const S = {mock:{}, company:{}, anomalies:null, analyzedText:'', analyzedState:{}, spans:[], coverage:null, coverageErr:'',
-  analyzeElapsed:null, analyzeModel:'', markdown:'', auditAt:null, auditElapsed:null, renderer:null, model:null, filter:'all', tab:'findings', busy:null};
+  analyzeElapsed:null, analyzeModel:'', modelUsed:null, modelSource:'', markdown:'', auditAt:null, auditElapsed:null, renderer:null, model:null, filter:'all', tab:'findings', busy:null};
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const pretty = k => String(k || '').replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase());
@@ -533,7 +533,7 @@ function headers(){
   if ($('model').value.trim()) h['X-LLM-Model'] = $('model').value.trim();
   return h;
 }
-async function call(path, body, {llm = true} = {}){
+async function call(path, body, {llm = true, withHeaders = false} = {}){
   let r;
   try { r = await fetch(API + path, body ? {method:'POST', headers: llm ? headers() : {'Content-Type':'application/json'}, body:JSON.stringify(body)} : {}); }
   catch { const e = new Error(FILE_MODE ? 'This page was opened from a file. Open it through uvicorn at http://127.0.0.1:8000/ instead.' : 'Could not reach the API. Is uvicorn running?'); e.code = 'OFFLINE'; throw e; }
@@ -543,9 +543,9 @@ async function call(path, body, {llm = true} = {}){
     const msg = typeof d === 'string' ? d : d?.message || (Array.isArray(d) ? d.map(x => x.msg).join('; ') : `HTTP ${r.status}`);
     const e = new Error(msg); e.status = r.status; e.code = d?.error || (r.status === 422 ? 'INVALID_INPUT' : 'HTTP'); throw e;
   }
-  return data;
+  return withHeaders ? {data, headers:r.headers} : data;
 }
-/** What the user asked for in the model settings. The analysis API does not report the model it used. */
+/** What the user asked for in the model settings (sent as X-LLM-* headers). */
 function requestedModel(){
   const p = $('provider').value, m = $('model').value.trim(), k = $('key').value.trim();
   return [p || (k ? 'provider from key' : 'server default'), m].filter(Boolean).join(' · ');
@@ -737,7 +737,7 @@ function renderFindings(){
   const list = S.anomalies, c = sevCounts(list), total = list.length, m = matchCounts(list);
   $('cntFindings').textContent = total; $('cntFindings').classList.remove('hidden');
   $('cntSource').textContent = `${m.exact}/${total}`; $('cntSource').classList.toggle('hidden', !total);
-  const meta = `${S.analyzeElapsed != null ? `Analyzed in ${S.analyzeElapsed.toFixed(1)}s` : 'Analyzed'} · <span class="prov">model <b>${esc(S.analyzeModel)}</b></span>`;
+  const meta = `${S.analyzeElapsed != null ? `Analyzed in ${S.analyzeElapsed.toFixed(1)}s` : 'Analyzed'} · <span class="prov" id="modelMeta">${modelMetaHtml()}</span>`;
   if (!total){
     $('findings').innerHTML = `<div class="allclear"><div class="big">✓</div><h3>No gaps found</h3><p>The model reported no gaps for this regulation. ${meta}</p></div>
       <div style="margin-top:16px">${covStrip()}</div>`;
@@ -957,7 +957,15 @@ function renderMarkdown(md){
   if (window.marked && window.DOMPurify) return DOMPurify.sanitize(marked.parse(md));
   return `<pre>${esc(md)}</pre>`;
 }
+/** Which model analyzed the text: the server's X-LLM-Model-Used header when present; "offline
+    demo" once the audit log reveals demo mode; otherwise the requested model, labelled as such. */
+function modelMetaHtml(){
+  if (S.modelSource === 'server') return `model used <b>${esc(S.modelUsed)}</b>`;
+  if (S.modelSource === 'demo') return '<b>offline demo</b> · no LLM called';
+  return `model <b>${esc(S.analyzeModel)}</b> <span title="The server did not report which model it used (it omits the header in demo mode and for non-ASCII model names).">(requested)</span>`;
+}
 function authorLabel(){
+  if (S.modelSource === 'demo' && S.renderer === 'deterministic') return 'Rendered deterministically <span class="meta-txt">(offline demo, no LLM called)</span>';
   if (S.renderer === 'llm') return `Drafted by <b>${esc(S.model || 'unknown model')}</b> (LLM)`;
   if (S.renderer === 'deterministic') return `Rendered deterministically${S.model ? ` <span class="meta-txt">(model ${esc(S.model)} was called, but its draft was not used)</span>` : ' <span class="meta-txt">(no model wrote this text)</span>'}`;
   return 'Author not reported';
@@ -1004,10 +1012,11 @@ async function analyze(){
   const model = requestedModel();
   const p = progress($('findings'), 'Analyzing regulation', `${text.length.toLocaleString()} chars · ${Object.keys(company_state).length} company fields · ${model}`, ANALYZE_STEPS, {skeleton:true});
   try {
-    const result = await call('/api/analyze-regulation', {text, company_state});
+    const {data:result, headers:rh} = await call('/api/analyze-regulation', {text, company_state}, {withHeaders:true});
     S.analyzeElapsed = await p.finish();
     S.anomalies = Array.isArray(result) ? result : [];
     S.analyzedText = text; S.analyzedState = company_state; S.analyzeModel = model;
+    S.modelUsed = rh.get('X-LLM-Model-Used'); S.modelSource = S.modelUsed ? 'server' : 'requested';
     S.markdown = ''; S.renderer = null; S.model = null; S.filter = 'all';
     S.spans = S.anomalies.map(a => toJsSpan(text, a.excerpt_span));
     await loadCoverage();
@@ -1031,6 +1040,10 @@ async function audit(){
     const r = await call('/api/generate-audit', {anomalies: S.anomalies, company_state});
     S.auditElapsed = await p.finish();
     S.markdown = r.markdown || ''; S.renderer = r.renderer || null; S.model = r.model ?? null; S.auditAt = new Date();
+    // Demo mode shows itself only in the audit log: deterministic, no model, "offline-demo" in its header.
+    if (!S.modelUsed && S.renderer === 'deterministic' && !S.model && /offline-demo/.test(S.markdown)){
+      S.modelSource = 'demo'; if ($('modelMeta')) $('modelMeta').innerHTML = modelMetaHtml();
+    }
     setBusy(null); renderReport();
     toast(S.renderer === 'llm' ? `Draft written by ${S.model || 'the model'}` : 'Draft rendered deterministically');
   } catch (e){
