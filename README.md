@@ -142,15 +142,19 @@ Paste in a new regulation and a JSON snapshot of how the company is set up today
 
 ### Frontend
 
-Run `uvicorn main:app --reload` and open **http://127.0.0.1:8000/**. One page (`static/index.html`, no build step):
+Run `uvicorn main:app --reload` and open **http://127.0.0.1:8000/**. Open the page through uvicorn, not from a file, because the API refuses `file://` pages. For an offline demo with no LLM, run `AI_ENGINE_DEMO=1 uvicorn main:app` and click *Load sample and analyze*. One page (`static/index.html`, no build step):
 
 1. **Company state:** the mock FintechX profile shown as tiles, editable as JSON.
-2. **Regulation:** paste text, or click *Load sample* (or press `S`). Then click **Analyze gaps** (or press Cmd/Ctrl+Enter). A staged progress panel runs while the model works.
-3. **Findings:** a severity donut and counters (click one to filter), then one card per gap. Each card has the highlighted verbatim quote with a **Grounded** badge (the page checks again that the quote appears in your text), the clause it came from, and the requirement set side by side with the company setting it breaks. Hovering a card highlights that field in the company-state panel.
-4. **Source grounding:** the regulation text with every quoted excerpt highlighted. Click a highlight to jump to its finding.
-5. **Audit log:** **Generate audit log** renders the Markdown report as a document, which you can download, copy, print to PDF or regenerate.
+2. **Regulation:** paste text, or click *Load sample* (or press `S`). Then click **Analyze gaps** (or press Cmd/Ctrl+Enter). While the model works, a progress panel shows the real elapsed time and the engine's stages. The stage ticks are illustrative, because the model call is a single request.
+3. **Findings:** a severity donut and counters (click one to filter), a clause-coverage strip, then one card per gap. Each card shows:
+   - the quote, with a badge from the server's `excerpt_match`: *Verified · verbatim*, *Partial quote*, *Unverified citation · closest clause (score)* or *No matching source*;
+   - its clause (labels understand `Section 4.1`, `(iv)` and `(v) c.` style numbering);
+   - the requirement side by side with the company fields from `state_fields`. Hovering a card highlights those fields in the company-state panel.
+4. **Clause coverage:** every clause of the regulation from `POST /api/coverage`, marked *Gap*, *Needs info* or **Not flagged** (hatched: the model raised nothing there, so review it by hand). A clause map and counters show, for example, "3 of 24 clauses assessed · 21 not flagged". Each clause links to its findings and its place in the source.
+5. **Source grounding:** the regulation text with each excerpt highlighted at the exact `excerpt_span` the server verified, and unflagged clauses hatched. Click a highlight to jump to it.
+6. **Audit log:** **Generate audit log** renders the Markdown report as a document marked *Draft · pending human review*, with who wrote it ("Drafted by <model> (LLM)" or "Rendered deterministically"). You can download it, copy it, print it to PDF or regenerate it.
 
-Optional provider, model and API key fields send the `X-LLM-*` headers. The key is never stored. The header shows API health and the model in use. It has a dark/light toggle (`T`). Press `?` to list the keyboard shortcuts.
+Optional provider, model and API key fields send the `X-LLM-*` headers. The key is never stored. The header shows API health and the requested model. An unknown model or bad server setting is reported as a setup problem, not as a missing key. It has a dark/light toggle (`T`). Press `?` to list the keyboard shortcuts.
 
 ### Setup and run
 
