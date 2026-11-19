@@ -144,12 +144,13 @@ Paste in a new regulation and a JSON snapshot of how the company is set up today
 
 Run `uvicorn main:app --reload` and open **http://127.0.0.1:8000/**. One page (`static/index.html`, no build step):
 
-1. **Company state:** the mock FintechX profile, editable as JSON.
-2. **Regulation:** paste text, or click *Load sample regulation*. Then click **Analyze gaps** (or press Cmd/Ctrl+Enter).
-3. **Findings:** counts by severity, then one colour-coded card per gap with the verbatim regulation quote, requirement, current state, gap and remediation. Gaps where the data is insufficient are marked separately.
-4. **Audit log:** **Generate audit log** renders the Markdown report, which you can download or copy.
+1. **Company state:** the mock FintechX profile shown as tiles, editable as JSON.
+2. **Regulation:** paste text, or click *Load sample* (or press `S`). Then click **Analyze gaps** (or press Cmd/Ctrl+Enter). A staged progress panel runs while the model works.
+3. **Findings:** a severity donut and counters (click one to filter), then one card per gap. Each card has the highlighted verbatim quote with a **Grounded** badge (the page checks again that the quote appears in your text), the clause it came from, and the requirement set side by side with the company setting it breaks. Hovering a card highlights that field in the company-state panel.
+4. **Source grounding:** the regulation text with every quoted excerpt highlighted. Click a highlight to jump to its finding.
+5. **Audit log:** **Generate audit log** renders the Markdown report as a document, which you can download, copy, print to PDF or regenerate.
 
-Optional provider, model and API key fields send the `X-LLM-*` headers. The key is never stored. The header dot shows whether the API is up.
+Optional provider, model and API key fields send the `X-LLM-*` headers. The key is never stored. The header shows API health and the model in use. It has a dark/light toggle (`T`). Press `?` to list the keyboard shortcuts.
 
 ### Setup and run
 
