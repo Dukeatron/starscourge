@@ -273,7 +273,7 @@ async function main() {
         throw new Error('UI showed an error: ' + (await page.locator(SEL.errorVisible).innerText()).replace(/\s+/g, ' '));
       }),
     ]);
-    mark('findings-visible', 'Gaps ranked critical first.');
+    mark('findings-visible', 'Gaps ranked by severity.');
     await page.mouse.move(SIZE.width * 0.62, 330, { steps: T.steps });
     await wait(T.longRead); // let the donut and counters animate
     await glideTo(page, page.locator(SEL.groundMeter));
@@ -323,9 +323,26 @@ async function main() {
     const m = await marks.count();
     for (let i = 0; i < Math.min(m, 4); i++) { await glideTo(page, marks.nth(i)); await wait(T.beat); }
     if (INJECTION_LINE) {
-      const inj = page.locator(SEL.sourceText).getByText('ignore all previous instructions', { exact: false });
-      await smoothScroll(page.locator(SEL.sourceText), 'end');
-      if (await inj.count()) await glideTo(page, inj.first());
+      // #srcText is its own scroll container: scroll it (and the page) to the planted line,
+      // then point the cursor at the exact words.
+      await smoothScroll(page.locator(SEL.sourceText), 'center');
+      const rect = await page.locator(SEL.sourceText).evaluate(async (box, phrase) => {
+        const walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
+        let node;
+        while ((node = walker.nextNode())) {
+          const i = node.data.indexOf(phrase);
+          if (i < 0) continue;
+          const range = document.createRange();
+          range.setStart(node, i); range.setEnd(node, i + phrase.length);
+          const r0 = range.getBoundingClientRect(), b = box.getBoundingClientRect();
+          box.scrollBy({ top: r0.top - b.top - b.height / 2, behavior: 'smooth' });
+          await new Promise(r => setTimeout(r, 900));
+          const r = range.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        }
+        return null;
+      }, 'ignore all previous instructions');
+      if (rect) await page.mouse.move(rect.x, rect.y, { steps: T.steps });
       mark('injection', 'The planted instruction is treated as data, not a command.');
       await wait(T.longRead);
     }
