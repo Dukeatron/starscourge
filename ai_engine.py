@@ -5,6 +5,10 @@ Public contract (imported by the API layer):
     from ai_engine import analyze_compliance_gap, generate_audit_trail, LLMError
 
 All functions are synchronous and return plain JSON-serializable Python objects.
+Errors: ValueError for bad input; LLMConfigError for a missing or rejected key (its
+subclass LLMSetupError for setup a key will not fix, such as an unknown model); any
+other LLMError when the provider fails, cannot be reached or returns unusable output.
+No other exception type escapes.
 
 Bring your own key and model: every public function takes optional keyword-only
 `api_key`, `provider` and `model`. Providers: anthropic (native Claude API) plus any
@@ -19,7 +23,7 @@ at import time, and keys are never logged:
     LLM_MODEL             optional; per provider: <PROVIDER>_MODEL (e.g. GEMINI_MODEL)
     ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
     DEEPSEEK_API_KEY, MISTRAL_API_KEY, XAI_API_KEY, TOGETHER_API_KEY, LLM_API_KEY (custom)
-    LLM_TIMEOUT_SECONDS   optional, default 60
+    LLM_TIMEOUT_SECONDS   optional, default 60 (per read; connecting gives up after 5 s)
     LLM_EFFORT            optional (Claude only: low | medium | high | xhigh | max), default "medium"
 """
 
@@ -36,7 +40,7 @@ import time
 import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Callable, Literal, TypeVar
+from typing import Any, Callable, Literal, NamedTuple, TypeVar
 
 import anthropic
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -138,27 +142,33 @@ def _effort() -> str:
 
 # --------------------------------------------------------------------------- providers
 
-# OpenAI-compatible providers: name -> (base URL, key env vars, default model).
-# Every default model can be overridden with model=, <PROVIDER>_MODEL or LLM_MODEL.
-_OPENAI_COMPATIBLE: dict[str, tuple[str | None, tuple[str, ...], str]] = {
-    "openai": (None, ("OPENAI_API_KEY",), "gpt-5-mini"),
-    "gemini": (
+class _ProviderSpec(NamedTuple):
+    base_url: str | None  # None: the SDK default (OpenAI) or LLM_BASE_URL (custom)
+    key_env_vars: tuple[str, ...]
+    default_model: str  # "": discovered (ollama) or required from config (custom)
+
+
+# OpenAI-compatible providers. Every default model can be overridden with model=,
+# <PROVIDER>_MODEL or LLM_MODEL, and every base URL with <PROVIDER>_BASE_URL.
+_OPENAI_COMPATIBLE: dict[str, _ProviderSpec] = {
+    "openai": _ProviderSpec(None, ("OPENAI_API_KEY",), "gpt-5-mini"),
+    "gemini": _ProviderSpec(
         "https://generativelanguage.googleapis.com/v1beta/openai/",
         ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         "gemini-2.5-flash",
     ),
-    "groq": ("https://api.groq.com/openai/v1", ("GROQ_API_KEY",), "llama-3.3-70b-versatile"),
-    "openrouter": ("https://openrouter.ai/api/v1", ("OPENROUTER_API_KEY",), "openrouter/auto"),
-    "deepseek": ("https://api.deepseek.com", ("DEEPSEEK_API_KEY",), "deepseek-chat"),
-    "mistral": ("https://api.mistral.ai/v1", ("MISTRAL_API_KEY",), "mistral-large-latest"),
-    "xai": ("https://api.x.ai/v1", ("XAI_API_KEY",), "grok-4"),
-    "together": (
+    "groq": _ProviderSpec("https://api.groq.com/openai/v1", ("GROQ_API_KEY",), "llama-3.3-70b-versatile"),
+    "openrouter": _ProviderSpec("https://openrouter.ai/api/v1", ("OPENROUTER_API_KEY",), "openrouter/auto"),
+    "deepseek": _ProviderSpec("https://api.deepseek.com", ("DEEPSEEK_API_KEY",), "deepseek-chat"),
+    "mistral": _ProviderSpec("https://api.mistral.ai/v1", ("MISTRAL_API_KEY",), "mistral-large-latest"),
+    "xai": _ProviderSpec("https://api.x.ai/v1", ("XAI_API_KEY",), "grok-4"),
+    "together": _ProviderSpec(
         "https://api.together.xyz/v1",
         ("TOGETHER_API_KEY",),
         "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     ),
-    "ollama": ("http://localhost:11434/v1", ("OLLAMA_API_KEY",), ""),  # default: smallest installed model
-    "custom": (None, ("LLM_API_KEY",), ""),  # any OpenAI-compatible server: set LLM_BASE_URL + LLM_MODEL
+    "ollama": _ProviderSpec("http://localhost:11434/v1", ("OLLAMA_API_KEY",), ""),  # default: smallest installed model
+    "custom": _ProviderSpec(None, ("LLM_API_KEY",), ""),  # any OpenAI-compatible server: set LLM_BASE_URL + LLM_MODEL
 }
 PROVIDERS: tuple[str, ...] = ("anthropic",) + tuple(_OPENAI_COMPATIBLE)
 _ANTHROPIC_KEY_ENV = ("ANTHROPIC_API_KEY",)
@@ -205,7 +215,7 @@ def _load_dotenv() -> None:
 
 
 def _key_env_vars(provider: str) -> tuple[str, ...]:
-    return _ANTHROPIC_KEY_ENV if provider == "anthropic" else _OPENAI_COMPATIBLE[provider][1]
+    return _ANTHROPIC_KEY_ENV if provider == "anthropic" else _OPENAI_COMPATIBLE[provider].key_env_vars
 
 
 def _env_key(provider: str) -> str:
@@ -282,9 +292,6 @@ def _check_llm_args(api_key: Any, provider: Any = None, model: Any = None) -> No
         raise ValueError("model must be a non-empty string or None")
 
 
-_check_api_key = _check_llm_args  # backward-compatible name
-
-
 def _resolve_provider(provider: str | None = None, api_key: str | None = None) -> str:
     if provider is not None:
         return provider.strip().lower()
@@ -309,7 +316,7 @@ def _resolve_model(provider: str, model: str | None = None) -> str:
         return DEFAULT_MODEL
     if provider == "ollama":
         return _smallest_ollama_model()
-    default = _OPENAI_COMPATIBLE[provider][2]
+    default = _OPENAI_COMPATIBLE[provider].default_model
     if not default:
         raise LLMSetupError("provider 'custom' needs a model: pass model= or set LLM_MODEL")
     return default
@@ -324,11 +331,17 @@ def _resolve_base_url(provider: str) -> str | None:
         override = override or os.environ.get("LLM_BASE_URL", "").strip()
         if not override:
             raise LLMSetupError("provider 'custom' needs LLM_BASE_URL")
-    return override or _OPENAI_COMPATIBLE[provider][0]
+    return override or _OPENAI_COMPATIBLE[provider].base_url
 
 
-def _model_name() -> str:
-    """Model used when the caller passes no provider or model (for display)."""
+def _model_label(api_key: str | None, provider: str | None, model: str | None) -> str:
+    """The model name shown in the audit log header. Never raises: a configuration error
+    surfaces from the LLM call itself, and the no-gaps log needs no LLM at all."""
+    try:
+        return _resolve_model(_resolve_provider(provider, api_key), model)
+    except LLMConfigError:
+        if model:
+            return model
     try:
         return _resolve_model(_env_provider())
     except LLMConfigError:
@@ -422,7 +435,7 @@ def _provider_complete(
     api_key: str | None = None,
     provider: str | None = None,
     model: str | None = None,
-) -> dict | str:
+) -> str:
     """The only function that touches provider SDKs. Returns the raw response text."""
     name = _resolve_provider(provider, api_key)
     model_name = _resolve_model(name, model)
@@ -1021,7 +1034,7 @@ def _normalize_audit_items(anomalies: Any) -> list[dict]:
         for field in ("title", "gap_description"):
             if not isinstance(item.get(field), str) or not item[field].strip():
                 raise ValueError(f"anomaly #{position} has no {field}")
-        record = {k: v for k, v in item.items()}
+        record = dict(item)
         for key in OUTPUT_KEYS:
             value = record.get(key)
             record[key] = value.strip() if isinstance(value, str) else ("" if value is None else str(value))
@@ -1232,10 +1245,7 @@ def generate_audit_trail(
     when = _resolve_generated_at(generated_at)
     iso = when.strftime("%Y-%m-%dT%H:%M:%SZ")
     report_id = "AUD-" + when.strftime("%Y%m%dT%H%M%SZ")
-    try:
-        model_label = _resolve_model(_resolve_provider(provider, api_key), model)
-    except LLMConfigError:
-        model_label = model or _model_name()
+    model_label = _model_label(api_key, provider, model)
 
     if not items:
         return _render_no_gaps(iso, report_id, model_label)

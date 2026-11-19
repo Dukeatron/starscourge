@@ -9,12 +9,12 @@ config only, so callers cannot point the server at arbitrary hosts.
 """
 
 import logging
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pathlib import Path
 
 from ai_engine import (
     PROVIDERS,
