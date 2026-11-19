@@ -776,6 +776,48 @@ def test_ollama_default_model_falls_back_when_server_down(no_key, monkeypatch):
     assert ai_engine._resolve_model("ollama") == ai_engine.OLLAMA_FALLBACK_MODEL
 
 
+def test_ollama_discovery_is_cached_and_refreshed_after_ttl(no_key, monkeypatch):
+    import io
+
+    probes = []
+    tags = {"models": [{"name": "small:3b", "size": 3}]}
+
+    def urlopen(url, timeout):
+        probes.append(url)
+        return io.BytesIO(json.dumps(tags).encode())
+
+    clock = [1000.0]
+    monkeypatch.setattr(ai_engine.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ai_engine, "_ollama_default", None)
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    assert ai_engine._resolve_model("ollama") == "small:3b"
+    assert ai_engine._resolve_model("ollama") == "small:3b"
+    assert len(probes) == 1 and probes[0].endswith("/api/tags") and "/v1" not in probes[0]
+    tags["models"].append({"name": "tiny:1b", "size": 1})
+    clock[0] += ai_engine.OLLAMA_MODEL_TTL_SECONDS + 1
+    assert ai_engine._resolve_model("ollama") == "tiny:1b"
+    assert len(probes) == 2
+
+
+def test_ollama_down_is_cached_briefly(no_key, monkeypatch):
+    probes = []
+
+    def down(url, timeout):
+        probes.append(url)
+        raise OSError("connection refused")
+
+    clock = [1000.0]
+    monkeypatch.setattr(ai_engine.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ai_engine, "_ollama_default", None)
+    monkeypatch.setattr("urllib.request.urlopen", down)
+    for _ in range(3):
+        assert ai_engine._resolve_model("ollama") == ai_engine.OLLAMA_FALLBACK_MODEL
+    assert len(probes) == 1
+    clock[0] += ai_engine.OLLAMA_DOWN_TTL_SECONDS + 1
+    ai_engine._resolve_model("ollama")
+    assert len(probes) == 2
+
+
 def test_unknown_provider_is_value_error(provider):
     fake = provider('{"anomalies": []}')
     with pytest.raises(ValueError):

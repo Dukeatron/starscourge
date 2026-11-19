@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import threading
+import time
 import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -206,7 +207,12 @@ def _env_key(provider: str) -> str:
 
 DEFAULT_PROVIDER = "ollama"  # local models by default: no key, no cost, no data leaves the machine
 OLLAMA_FALLBACK_MODEL = "qwen2.5vl:3b"
-_ollama_default: str | None = None
+OLLAMA_TAGS_TIMEOUT_SECONDS = 2.0
+OLLAMA_MODEL_TTL_SECONDS = 300.0  # re-read the installed models every 5 minutes
+OLLAMA_DOWN_TTL_SECONDS = 10.0  # after a failed probe, skip probing for 10 seconds
+# Cached discovery result: (smallest installed model, or None if the probe failed, expiry
+# on the time.monotonic() clock). None means "not probed yet".
+_ollama_default: tuple[str | None, float] | None = None
 
 
 def _env_provider() -> str:
@@ -221,25 +227,37 @@ def _env_provider() -> str:
 
 
 def _smallest_ollama_model() -> str:
-    """Smallest model installed on the local Ollama server (cached), else OLLAMA_FALLBACK_MODEL."""
+    """Smallest model installed on the local Ollama server, else OLLAMA_FALLBACK_MODEL.
+
+    The /api/tags lookup is cached: a hit for OLLAMA_MODEL_TTL_SECONDS (so newly pulled
+    models are picked up), a failed probe for OLLAMA_DOWN_TTL_SECONDS (so a stopped server
+    costs one probe, not one per call).
+    """
     global _ollama_default
-    if _ollama_default:
-        return _ollama_default
+    now = time.monotonic()
+    cached = _ollama_default
+    if cached is not None and now < cached[1]:
+        return cached[0] or OLLAMA_FALLBACK_MODEL
+    found = _probe_ollama_models()
+    ttl = OLLAMA_MODEL_TTL_SECONDS if found else OLLAMA_DOWN_TTL_SECONDS
+    _ollama_default = (found, now + ttl)
+    return found or OLLAMA_FALLBACK_MODEL
+
+
+def _probe_ollama_models() -> str | None:
+    """Ask the Ollama server for its installed models; the smallest one's name, or None."""
     import urllib.request
 
-    base = (_resolve_base_url("ollama") or "http://localhost:11434/v1").rstrip("/")
-    root = base[: -len("/v1")] if base.endswith("/v1") else base
+    root = str(_resolve_base_url("ollama")).rstrip("/").removesuffix("/v1")
     try:
-        with urllib.request.urlopen(root + "/api/tags", timeout=2) as response:
+        with urllib.request.urlopen(root + "/api/tags", timeout=OLLAMA_TAGS_TIMEOUT_SECONDS) as response:
             models = json.load(response).get("models") or []
         sized = [(int(m.get("size") or 0), str(m.get("name") or m.get("model"))) for m in models]
         sized = [m for m in sized if m[0] > 0 and m[1] and m[1] != "None"]
-        if sized:
-            _ollama_default = min(sized)[1]
-            return _ollama_default
-    except Exception:  # server down or unexpected payload: use the fallback, retry next call
-        pass
-    return OLLAMA_FALLBACK_MODEL
+        return min(sized)[1] if sized else None
+    except Exception:  # server down or unexpected payload: the caller uses the fallback
+        logger.info("ollama model discovery failed; using %s", OLLAMA_FALLBACK_MODEL)
+        return None
 
 
 def _check_llm_args(api_key: Any, provider: Any = None, model: Any = None) -> None:
