@@ -1,15 +1,23 @@
 {
-  "captured_at_utc": "2026-11-19T08:34:30Z",
+  "captured_at_utc": "2026-11-19T08:57:00Z",
   "provider": "ollama",
   "model": "qwen2.5-coder:14b",
-  "analysis_source": "live /api/analyze-regulation",
-  "audit_source": "ai_engine._render_audit_fallback (deterministic, no LLM)",
+  "analysis_source": "saved response (analysis_merged.json)",
+  "audit_source": "live /api/generate-audit",
+  "audit_renderer": "llm",
+  "audit_model": "qwen2.5-coder:14b",
   "findings": 9,
   "severities": {
     "critical": 0,
-    "high": 3,
-    "medium": 6,
+    "high": 1,
+    "medium": 8,
     "low": 0
   },
-  "needs_info": 2
+  "needs_info": 1,
+  "excerpt_match": {
+    "exact": 8,
+    "fragment": 0,
+    "nearest": 1,
+    "none": 0
+  }
 }

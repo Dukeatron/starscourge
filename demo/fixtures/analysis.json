@@ -9,34 +9,20 @@
     "regulation_excerpt": "shall connect to the Network Time Protocol (NTP) Server of National Informatics Centre (NIC) or National Physical Laboratory (NPL) or with NTP servers traceable to these NTP servers",
     "current_state": "ntp_source_corporate_endpoints = time.windows.com, ntp_source_production = Amazon Time Sync Service (169.254.169.123)",
     "gap_description": "The company's NTP sources are not traceable to NIC or NPL.",
-    "recommended_remediation": "Switch to NTP servers traceable to NIC or NPL and update the configuration."
+    "recommended_remediation": "Switch to NTP servers traceable to NIC or NPL.",
+    "state_fields": [
+      "ntp_source_corporate_endpoints",
+      "ntp_source_production"
+    ],
+    "excerpt_match": "exact",
+    "excerpt_score": 1.0,
+    "excerpt_span": [
+      512,
+      693
+    ]
   },
   {
     "id": "ANOM-002",
-    "title": "Log Retention Period Too Short",
-    "category": "data_retention",
-    "severity": "high",
-    "gap_type": "non_compliant",
-    "regulation_requirement": "Maintain logs for 180 days.",
-    "regulation_excerpt": "(iv) All service providers, intermediaries, data centres, body corporate and Government organisations shall mandatorily enable logs of all their ICT systems and maintain them securely for a rolling",
-    "current_state": "ict_log_retention_days = 90",
-    "gap_description": "The log retention period is 90 days, which is less than the required 180 days.",
-    "recommended_remediation": "Increase the log retention period to 180 days and ensure compliance."
-  },
-  {
-    "id": "ANOM-003",
-    "title": "Log Storage Outside Indian Jurisdiction",
-    "category": "data_retention",
-    "severity": "high",
-    "gap_type": "non_compliant",
-    "regulation_requirement": "Maintain logs within Indian jurisdiction.",
-    "regulation_excerpt": "the same shall be maintained within the Indian jurisdiction",
-    "current_state": "ict_log_storage = Splunk Cloud, us-east-1 (N. Virginia)",
-    "gap_description": "Logs are stored in the US, outside the Indian jurisdiction.",
-    "recommended_remediation": "Move log storage to an Indian jurisdiction and ensure compliance."
-  },
-  {
-    "id": "ANOM-004",
     "title": "Cyber Incident Reporting SLA Exceeds Requirement",
     "category": "reporting",
     "severity": "medium",
@@ -45,22 +31,42 @@
     "regulation_excerpt": "shall mandatorily report cyber incidents as mentioned in Annexure I to CERT-In within 6 hours of noticing such incidents",
     "current_state": "cert_in_reporting_sla_hours = 24, cert_in_reporting_trigger = after SEV1/SEV2 triage is complete",
     "gap_description": "The company's reporting SLA is 24 hours, exceeding the required 6 hours.",
-    "recommended_remediation": "Reduce the reporting SLA to 6 hours and ensure compliance with the trigger condition."
+    "recommended_remediation": "Reduce the reporting SLA to 6 hours and ensure immediate reporting upon incident detection.",
+    "state_fields": [
+      "cert_in_reporting_sla_hours",
+      "cert_in_reporting_trigger"
+    ],
+    "excerpt_match": "exact",
+    "excerpt_score": 1.0,
+    "excerpt_span": [
+      1069,
+      1189
+    ]
   },
   {
-    "id": "ANOM-005",
-    "title": "Insufficient Information on POC Details Submission",
+    "id": "ANOM-003",
+    "title": "Point of Contact Details Not Submitted",
     "category": "governance",
     "severity": "medium",
-    "gap_type": "insufficient_information",
+    "gap_type": "non_compliant",
     "regulation_requirement": "Submit Point of Contact details to CERT-In.",
     "regulation_excerpt": "The Information relating to a Point of Contact shall be sent to CERT-In in the format specified at Annexure II",
-    "current_state": "Not specified in company state",
+    "current_state": "cert_in_poc_details_submitted = false, cert_in_poc_last_updated = null",
     "gap_description": "The company has not submitted Point of Contact details to CERT-In.",
-    "recommended_remediation": "Submit the Point of Contact details to CERT-In as per the specified format."
+    "recommended_remediation": "Submit the Point of Contact details to CERT-In as per the specified format.",
+    "state_fields": [
+      "cert_in_poc_details_submitted",
+      "cert_in_poc_last_updated"
+    ],
+    "excerpt_match": "exact",
+    "excerpt_score": 1.0,
+    "excerpt_span": [
+      2417,
+      2527
+    ]
   },
   {
-    "id": "ANOM-006",
+    "id": "ANOM-004",
     "title": "Insufficient Logging for Network Firewalls",
     "category": "security",
     "severity": "medium",
@@ -68,11 +74,20 @@
     "regulation_requirement": "Enable logs for all ICT systems.",
     "regulation_excerpt": "All service providers, intermediaries, data centres, body corporate and Government organisations shall mandatorily enable logs of all their ICT systems",
     "current_state": "ict_logging_not_enabled_for = [\"network firewalls\"]",
-    "gap_description": "Network firewalls are not logged.",
-    "recommended_remediation": "Enable logging for network firewalls and ensure they are included in the log retention policy."
+    "gap_description": "Network firewalls are not included in the logging.",
+    "recommended_remediation": "Enable logging for network firewalls and ensure they are included in the rolling retention period.",
+    "state_fields": [
+      "ict_logging_not_enabled_for"
+    ],
+    "excerpt_match": "exact",
+    "excerpt_score": 1.0,
+    "excerpt_span": [
+      2710,
+      2861
+    ]
   },
   {
-    "id": "ANOM-007",
+    "id": "ANOM-005",
     "title": "Insufficient Logging for VPN Concentrator",
     "category": "security",
     "severity": "medium",
@@ -80,11 +95,20 @@
     "regulation_requirement": "Enable logs for all ICT systems.",
     "regulation_excerpt": "All service providers, intermediaries, data centres, body corporate and Government organisations shall mandatorily enable logs of all their ICT systems",
     "current_state": "ict_logging_not_enabled_for = [\"VPN concentrator\"]",
-    "gap_description": "VPN concentrator is not logged.",
-    "recommended_remediation": "Enable logging for VPN concentrator and ensure it is included in the log retention policy."
+    "gap_description": "VPN concentrator is not included in the logging.",
+    "recommended_remediation": "Enable logging for VPN concentrator and ensure it is included in the rolling retention period.",
+    "state_fields": [
+      "ict_logging_not_enabled_for"
+    ],
+    "excerpt_match": "exact",
+    "excerpt_score": 1.0,
+    "excerpt_span": [
+      2710,
+      2861
+    ]
   },
   {
-    "id": "ANOM-008",
+    "id": "ANOM-006",
     "title": "Insufficient Logging for Corporate Laptops",
     "category": "security",
     "severity": "medium",
@@ -92,8 +116,59 @@
     "regulation_requirement": "Enable logs for all ICT systems.",
     "regulation_excerpt": "All service providers, intermediaries, data centres, body corporate and Government organisations shall mandatorily enable logs of all their ICT systems",
     "current_state": "ict_logging_not_enabled_for = [\"corporate laptops\"]",
-    "gap_description": "Corporate laptops are not logged.",
-    "recommended_remediation": "Enable logging for corporate laptops and ensure they are included in the log retention policy."
+    "gap_description": "Corporate laptops are not included in the logging.",
+    "recommended_remediation": "Enable logging for corporate laptops and ensure they are included in the rolling retention period.",
+    "state_fields": [
+      "ict_logging_not_enabled_for"
+    ],
+    "excerpt_match": "exact",
+    "excerpt_score": 1.0,
+    "excerpt_span": [
+      2710,
+      2861
+    ]
+  },
+  {
+    "id": "ANOM-007",
+    "title": "Log Retention Period Shorter than Required",
+    "category": "data_retention",
+    "severity": "medium",
+    "gap_type": "non_compliant",
+    "regulation_requirement": "Maintain logs for 180 days.",
+    "regulation_excerpt": "(iv) All service providers, intermediaries, data centres, body corporate and Government organisations shall mandatorily enable logs of all their ICT systems and maintain them securely for a rolling",
+    "current_state": "ict_log_retention_days = 90",
+    "gap_description": "The log retention period is 90 days, shorter than the required 180 days.",
+    "recommended_remediation": "Increase the log retention period to 180 days.",
+    "state_fields": [
+      "ict_log_retention_days"
+    ],
+    "excerpt_match": "nearest",
+    "excerpt_score": 1.0,
+    "excerpt_span": [
+      2705,
+      2902
+    ]
+  },
+  {
+    "id": "ANOM-008",
+    "title": "Logs Not Stored in Indian Jurisdiction",
+    "category": "data_retention",
+    "severity": "medium",
+    "gap_type": "non_compliant",
+    "regulation_requirement": "Store logs within Indian jurisdiction.",
+    "regulation_excerpt": "the same shall be maintained within the Indian jurisdiction",
+    "current_state": "ict_log_storage = Splunk Cloud, us-east-1 (N. Virginia)",
+    "gap_description": "Logs are stored in the US, not within the Indian jurisdiction.",
+    "recommended_remediation": "Move log storage to an Indian jurisdiction, such as AWS regions in India.",
+    "state_fields": [
+      "ict_log_storage"
+    ],
+    "excerpt_match": "exact",
+    "excerpt_score": 1.0,
+    "excerpt_span": [
+      2926,
+      2985
+    ]
   },
   {
     "id": "ANOM-009",
@@ -105,6 +180,15 @@
     "regulation_excerpt": "shall connect to the Network Time Protocol (NTP) Server of National Informatics Centre (NIC) or National Physical Laboratory (NPL) or with NTP servers traceable to these NTP servers",
     "current_state": "Not specified in company state",
     "gap_description": "There is no information on NTP drift monitoring against NPL or NIC.",
-    "recommended_remediation": "Implement NTP drift monitoring against NPL or NIC and document the process."
+    "recommended_remediation": "Implement NTP drift monitoring against NPL or NIC and document the process.",
+    "state_fields": [
+      "ntp_drift_monitoring_against_npl_nic"
+    ],
+    "excerpt_match": "exact",
+    "excerpt_score": 1.0,
+    "excerpt_span": [
+      512,
+      693
+    ]
   }
 ]
