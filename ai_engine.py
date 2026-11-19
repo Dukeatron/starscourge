@@ -68,7 +68,11 @@ DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_EFFORT = "medium"
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-SDK_MAX_RETRIES = 3
+CONNECT_TIMEOUT_SECONDS = 5.0  # an unreachable host fails in seconds, not LLM_TIMEOUT_SECONDS
+SDK_MAX_RETRIES = 3  # SDK retries of transient HTTP failures (429, 5xx, dropped connections)
+# Local Ollama has no rate limits or flaky network to ride out, and retrying a read
+# timeout would re-run the whole (slow) local generation, so it fails at once.
+LOCAL_MAX_RETRIES = 0
 MAX_ATTEMPTS = 3  # total attempts on unusable output
 AUDIT_ATTEMPTS = 2  # LLM attempts for the audit log before the deterministic fallback
 DEFAULT_MAX_TOKENS = 16000  # room for adaptive thinking plus up to 25 findings
@@ -354,20 +358,50 @@ def _get_client(api_key: str | None = None, provider: str | None = None) -> Any:
         if client is not None:
             _clients.move_to_end(cache_key)
             return client
+        # Per-read timeout as configured, but give up on connecting much sooner. Each SDK
+        # takes its own Timeout type (they may be built on different httpx versions).
+        connect = min(timeout, CONNECT_TIMEOUT_SECONDS)
         if name == "anthropic":
-            client = anthropic.Anthropic(api_key=key, timeout=timeout, max_retries=SDK_MAX_RETRIES)
+            client = anthropic.Anthropic(
+                api_key=key, timeout=anthropic.Timeout(timeout, connect=connect), max_retries=SDK_MAX_RETRIES
+            )
         else:
             try:
                 import openai
             except ImportError:
                 raise LLMConfigError(f"provider '{name}' needs the openai package: pip install openai") from None
             client = openai.OpenAI(
-                api_key=key, base_url=base_url, timeout=timeout, max_retries=SDK_MAX_RETRIES
+                api_key=key, base_url=base_url, timeout=openai.Timeout(timeout, connect=connect),
+                max_retries=LOCAL_MAX_RETRIES if name == "ollama" else SDK_MAX_RETRIES,
             )
         _clients[cache_key] = client
         while len(_clients) > _MAX_CACHED_CLIENTS:
             _clients.popitem(last=False)
         return client
+
+
+def _connection_error(provider: str, exc: Exception, timeout_type: type) -> LLMError:
+    """A clear, secret-free LLMError for a provider that could not be reached or timed out.
+
+    `timeout_type` is the SDK's APITimeoutError. A timeout while connecting (the httpx
+    cause is a ConnectTimeout) is reported as "could not connect", not as a slow model.
+    """
+    connect_timeout = type(exc.__cause__).__name__ == "ConnectTimeout"
+    if isinstance(exc, timeout_type) and not connect_timeout:
+        try:
+            limit = f"{_timeout_seconds():g}"
+        except LLMConfigError:
+            limit = "the configured"
+        return LLMError(
+            f"{provider} did not respond within {limit} seconds; "
+            "try a smaller model or raise LLM_TIMEOUT_SECONDS"
+        )
+    if provider == "ollama":
+        return LLMError(
+            "could not connect to the local Ollama server: start it with `ollama serve` "
+            "and pull a model (`ollama pull qwen2.5:3b`), or choose another provider and pass its API key"
+        )
+    return LLMError(f"could not connect to {provider}; check the network and try again")
 
 
 def _provider_complete(
@@ -429,6 +463,8 @@ def _anthropic_complete(
         raise LLMConfigError(f"model '{model_name}' not found") from exc
     except anthropic.APIStatusError as exc:
         raise LLMError(f"provider error: HTTP {exc.status_code} ({type(exc).__name__})") from exc
+    except anthropic.APIConnectionError as exc:  # includes APITimeoutError
+        raise _connection_error("anthropic", exc, anthropic.APITimeoutError) from exc
     except anthropic.AnthropicError as exc:
         raise LLMError(f"provider error: {type(exc).__name__}") from exc
 
@@ -505,6 +541,8 @@ def _openai_compatible_complete(
         raise LLMConfigError(f"model '{model_name}' not found at {provider}") from exc
     except openai.APIStatusError as exc:
         raise LLMError(f"{provider} error: HTTP {exc.status_code} ({type(exc).__name__})") from exc
+    except openai.APIConnectionError as exc:  # includes APITimeoutError
+        raise _connection_error(provider, exc, openai.APITimeoutError) from exc
     except openai.OpenAIError as exc:
         raise LLMError(f"{provider} error: {type(exc).__name__}") from exc
     if response is None:

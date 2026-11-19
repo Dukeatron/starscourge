@@ -934,6 +934,54 @@ def test_openai_compatible_rejected_key_is_config_error():
         ai_engine._openai_compatible_complete(client, "openai", "m", "p", "", False, None, 0.0, 10)
 
 
+def test_clients_fail_fast_on_connect_and_ollama_does_not_retry(no_key):
+    cloud = ai_engine._get_client("AIzaSyTEST", None)
+    assert cloud.timeout.connect == ai_engine.CONNECT_TIMEOUT_SECONDS
+    assert cloud.timeout.read == ai_engine.DEFAULT_TIMEOUT_SECONDS
+    assert cloud.max_retries == ai_engine.SDK_MAX_RETRIES
+    claude = ai_engine._get_client("sk-ant-test", None)
+    assert claude.timeout.connect == ai_engine.CONNECT_TIMEOUT_SECONDS
+    local = ai_engine._get_client(None, "ollama")
+    assert local.max_retries == 0
+
+
+def _connection_errors():
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "http://localhost:11434/v1/chat/completions")
+    refused = openai.APIConnectionError(request=request)
+    read_timeout = openai.APITimeoutError(request=request)
+    read_timeout.__cause__ = httpx.ReadTimeout("slow")
+    connect_timeout = openai.APITimeoutError(request=request)
+    connect_timeout.__cause__ = httpx.ConnectTimeout("unreachable")
+    return refused, read_timeout, connect_timeout
+
+
+def test_ollama_down_gives_an_actionable_message():
+    refused, _, connect_timeout = _connection_errors()
+    for err in (refused, connect_timeout):
+        client = FakeOpenAIClient(errors=[err])
+        with pytest.raises(LLMError, match="ollama serve") as info:
+            ai_engine._openai_compatible_complete(client, "ollama", "m", "p", "", False, None, 0.0, 10)
+        assert not isinstance(info.value, LLMConfigError)
+
+
+def test_read_timeout_names_the_setting(monkeypatch):
+    _, read_timeout, _ = _connection_errors()
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "45")
+    client = FakeOpenAIClient(errors=[read_timeout])
+    with pytest.raises(LLMError, match="within 45 seconds.*LLM_TIMEOUT_SECONDS"):
+        ai_engine._openai_compatible_complete(client, "groq", "m", "p", "", False, None, 0.0, 10)
+
+
+def test_cloud_connection_error_is_llm_error():
+    refused, _, _ = _connection_errors()
+    client = FakeOpenAIClient(errors=[refused])
+    with pytest.raises(LLMError, match="could not connect to openai"):
+        ai_engine._openai_compatible_complete(client, "openai", "m", "p", "", False, None, 0.0, 10)
+
+
 def test_end_to_end_through_openai_compatible_path(no_key, monkeypatch):
     payload = json.dumps({"anomalies": [make_anomaly()]})
     client = FakeOpenAIClient(payload)
