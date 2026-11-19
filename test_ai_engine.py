@@ -1067,6 +1067,13 @@ def test_state_fields_are_validated_against_real_keys(provider):
     assert by_title["Malformed"]["state_fields"] == []
 
 
+def test_state_fields_are_not_inferred_from_the_not_specified_sentinel(provider):
+    state = {"company": "FintechX", "state": "CA", "data_retention_days": 30}
+    provider({"anomalies": [make_anomaly(gap_type="insufficient_information", current_state="whatever")]})
+    [a] = analyze_compliance_gap(REGULATION, state)
+    assert a["current_state"] == ai_engine.NOT_SPECIFIED and a["state_fields"] == []
+
+
 def test_findings_carry_excerpt_metadata(provider):
     provider({"anomalies": [
         make_anomaly(),

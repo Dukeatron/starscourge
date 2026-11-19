@@ -876,9 +876,12 @@ def _finalize_anomalies(items: list[_Anomaly], regulation_text: str, state: dict
         record["excerpt_match"] = grounded.match
         record["excerpt_score"] = grounded.score
         record["excerpt_span"] = list(grounded.span) if grounded.span else None
-        record["state_fields"] = _resolve_state_fields(record["state_fields"], record["current_state"], known_paths)
         if record["gap_type"] == "insufficient_information" or not record["current_state"]:
             record["current_state"] = NOT_SPECIFIED
+        # Infer keys only from a real description of the state, never from the sentinel
+        # (its words, e.g. "company", could otherwise match a key).
+        described = "" if record["current_state"] == NOT_SPECIFIED else record["current_state"]
+        record["state_fields"] = _resolve_state_fields(record["state_fields"], described, known_paths)
         cleaned.append(record)
 
     cleaned.sort(key=lambda r: SEVERITY_RANK[r["severity"]])  # stable
