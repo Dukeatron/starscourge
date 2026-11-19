@@ -31,3 +31,10 @@ class AuditGenerationRequest(BaseModel):
         if self.text is None and self.anomalies is None:
             raise ValueError("provide `text` or `anomalies`")
         return self
+
+
+class CoverageRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=MAX_REGULATION_CHARS, description="The regulation text that was analyzed")
+    anomalies: List[Dict[str, Any]] = Field(
+        ..., description="Findings from /api/analyze-regulation for that text (their excerpt_span is used)."
+    )

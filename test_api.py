@@ -186,6 +186,29 @@ def test_provider_failure_maps_to_502(fake_provider):
     assert response.json()["detail"]["error"] == "LLM_UNAVAILABLE"
 
 
+def test_unknown_model_maps_to_500_not_401(fake_provider):
+    fake_provider(ai_engine.LLMSetupError("model 'nope' not found at ollama: pull it with `ollama pull nope`"))
+    response = client.post("/api/analyze-regulation", json={"text": REGULATION})
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert detail["error"] == "LLM_CONFIG" and "ollama pull nope" in detail["message"]
+    assert "X-LLM-Api-Key" not in detail["message"]  # a key would not fix this
+
+
+def test_bad_server_env_maps_to_500(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "not-a-provider")
+    response = client.post("/api/analyze-regulation", json={"text": REGULATION})
+    assert response.status_code == 500
+    assert response.json()["detail"]["error"] == "LLM_CONFIG"
+
+
+def test_ollama_down_maps_to_502_with_actionable_message(fake_provider):
+    fake_provider(ai_engine._connection_error("ollama", RuntimeError(), TimeoutError))
+    response = client.post("/api/analyze-regulation", json={"text": REGULATION})
+    assert response.status_code == 502
+    assert "ollama serve" in response.json()["detail"]["message"]
+
+
 def test_persistent_bad_output_maps_to_502(fake_provider):
     fake_provider("garbage")
     assert client.post("/api/analyze-regulation", json={"text": REGULATION}).status_code == 502
@@ -200,6 +223,117 @@ def test_api_key_is_not_echoed_in_errors(fake_provider):
     assert "sk-ant-secret" not in response.text
 
 
+# --------------------------------------------------------------------------- additive response fields
+
+
+def test_analyze_response_adds_grounding_and_state_fields(fake_provider):
+    fake_provider(json.dumps({"anomalies": [finding(state_fields=["data_retention_days"])]}))
+    [a] = client.post("/api/analyze-regulation", json={"text": REGULATION}).json()
+    assert {k: a[k] for k in finding()} == {**finding(), "regulation_excerpt": a["regulation_excerpt"]}  # old keys intact
+    assert a["state_fields"] == ["data_retention_days"]
+    assert a["excerpt_match"] == "exact" and a["excerpt_score"] == 1.0
+    start, end = a["excerpt_span"]
+    assert REGULATION[start:end] == a["regulation_excerpt"]
+
+
+def test_generate_audit_response_adds_renderer_and_model(fake_provider):
+    fake_provider("not a valid audit log")
+    anomalies = [{"id": "ANOM-001", **finding()}]
+    body = client.post(
+        "/api/generate-audit", json={"anomalies": anomalies}, headers={"X-LLM-Provider": "groq", "X-LLM-Model": "llama-x"}
+    ).json()
+    assert set(body) == {"anomalies", "markdown", "renderer", "model"}
+    assert (body["renderer"], body["model"]) == ("deterministic", "llama-x")
+
+    empty = client.post("/api/generate-audit", json={"anomalies": []}).json()
+    assert (empty["renderer"], empty["model"]) == ("deterministic", None)
+
+
+def test_coverage_endpoint_maps_findings_to_clauses(fake_provider):
+    calls = fake_provider(json.dumps({"anomalies": [finding(), finding(
+        title="No DPO", gap_type="insufficient_information", gap_description="DPO unknown",
+        regulation_excerpt="Every regulated entity must appoint a Data Protection Officer (DPO)",
+    )]}))
+    anomalies = client.post("/api/analyze-regulation", json={"text": REGULATION}).json()
+    calls.clear()
+    response = client.post("/api/coverage", json={"text": REGULATION, "anomalies": anomalies})
+    assert response.status_code == 200 and calls == []  # deterministic, no LLM
+    body = response.json()
+    assert set(body) == {"coverage"}
+    clauses = body["coverage"]
+    assert [c["id"] for c in clauses] == [f"CL-{i:03d}" for i in range(1, len(clauses) + 1)]
+    assert all(set(c) == {"id", "text", "span", "status", "finding_ids"} for c in clauses)
+    assert all(REGULATION[c["span"][0]:c["span"][1]] == c["text"] for c in clauses)
+    by_status = {c["status"]: c["finding_ids"] for c in clauses if c["finding_ids"]}
+    ids = {a["title"]: a["id"] for a in anomalies}
+    assert by_status["gap"] == [ids["Data retention period too short"]]
+    assert by_status["needs_info"] == [ids["No DPO"]]
+    assert sum(c["status"] == "not_flagged" for c in clauses) == len(clauses) - 2
+    assert not any(c["text"].startswith("Data Protection and Retention Regulation") for c in clauses)  # heading
+
+
+def test_coverage_with_no_findings_and_bad_bodies():
+    ok = client.post("/api/coverage", json={"text": REGULATION, "anomalies": []})
+    assert ok.status_code == 200 and all(c["status"] == "not_flagged" for c in ok.json()["coverage"])
+    for body in ({"anomalies": []}, {"text": REGULATION}, {"text": "", "anomalies": []},
+                 {"text": "x" * 100_001, "anomalies": []}, {"text": REGULATION, "anomalies": "nope"}):
+        assert client.post("/api/coverage", json=body).status_code == 422
+    blank = client.post("/api/coverage", json={"text": "   ", "anomalies": []})
+    assert blank.status_code == 422 and blank.json()["detail"]["error"] == "INVALID_INPUT"
+
+
+# --------------------------------------------------------------------------- offline demo mode
+
+
+def test_demo_mode_runs_the_ui_sample_offline(fake_provider, monkeypatch):
+    import demo_fixtures
+
+    calls = fake_provider(AssertionError("demo mode must not call a provider"))
+    monkeypatch.setenv("AI_ENGINE_DEMO", "1")
+    response = client.post(
+        "/api/analyze-regulation",
+        json={"text": "  " + demo_fixtures.UI_SAMPLE_REGULATION.replace("\n", "\r\n"), "company_state": get_compliance_state()},
+    )
+    assert response.status_code == 200
+    anomalies = response.json()
+    assert [a["id"] for a in anomalies] == ["ANOM-001", "ANOM-002", "ANOM-003", "ANOM-004"]
+    assert all(set(a) == set(finding()) | {"id", "state_fields", "excerpt_match", "excerpt_score", "excerpt_span"} for a in anomalies)
+    assert all(a["regulation_excerpt"] in demo_fixtures.UI_SAMPLE_REGULATION for a in anomalies)
+
+    audit = client.post("/api/generate-audit", json={"anomalies": anomalies})
+    assert audit.status_code == 200
+    markdown = audit.json()["markdown"]
+    assert demo_fixtures.DEMO_MODEL_LABEL in markdown and "### ANOM-004" in markdown
+    assert calls == []
+
+
+def test_demo_mode_refuses_input_it_has_no_recording_for(fake_provider, monkeypatch):
+    calls = fake_provider(AssertionError("demo mode must not call a provider"))
+    monkeypatch.setenv("AI_ENGINE_DEMO", "1")
+    edited_state = {**get_compliance_state(), "data_retention_days": 365}
+    for body in ({"text": REGULATION}, {"text": "Some other regulation text.", "company_state": edited_state}):
+        response = client.post("/api/analyze-regulation", json=body)
+        assert response.status_code == 502
+        assert "AI_ENGINE_DEMO" in response.json()["detail"]["message"]
+    assert calls == []
+
+
+def test_demo_fixture_matches_the_ui_sample_regulation():
+    """If the UI's sample text changes, demo_fixtures.UI_SAMPLE_REGULATION must follow it."""
+    import re
+    from pathlib import Path
+
+    import demo_fixtures
+
+    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+    match = re.search(r"const SAMPLE = `(.*?)`;", html, re.DOTALL)
+    if match is None:
+        pytest.skip("the UI no longer defines a SAMPLE regulation")
+    assert " ".join(match.group(1).split()) == " ".join(demo_fixtures.UI_SAMPLE_REGULATION.split()), (
+        "static/index.html SAMPLE changed: update demo_fixtures.UI_SAMPLE_REGULATION and its findings"
+    )
+
+
 def test_cors_allows_the_key_header():
     response = client.options(
         "/api/analyze-regulation",
@@ -210,4 +344,30 @@ def test_cors_allows_the_key_header():
         },
     )
     assert response.status_code == 200
-    assert response.headers["access-control-allow-origin"] == "*"
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def _preflight(origin):
+    return client.options(
+        "/api/analyze-regulation",
+        headers={"Origin": origin, "Access-Control-Request-Method": "POST",
+                 "Access-Control-Request-Headers": "x-llm-api-key,content-type"},
+    )
+
+
+@pytest.mark.parametrize("origin", ["http://127.0.0.1:8000", "http://localhost", "https://localhost:3000"])
+def test_cors_allows_local_origins(origin):
+    response = _preflight(origin)
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+
+
+@pytest.mark.parametrize(
+    "origin", ["https://evil.example", "http://localhost.evil.example", "http://127.0.0.1.evil.example:80", "null"]
+)
+def test_cors_rejects_other_origins(origin):
+    response = _preflight(origin)
+    assert response.status_code == 400
+    assert "access-control-allow-origin" not in response.headers
+    simple = client.get("/health", headers={"Origin": origin})
+    assert "access-control-allow-origin" not in simple.headers

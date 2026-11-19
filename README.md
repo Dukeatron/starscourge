@@ -142,14 +142,19 @@ Paste in a new regulation and a JSON snapshot of how the company is set up today
 
 ### Frontend
 
-Run `uvicorn main:app --reload` and open **http://127.0.0.1:8000/**. One page (`static/index.html`, no build step):
+Run `uvicorn main:app --reload` and open **http://127.0.0.1:8000/**. Open the page through uvicorn, not from a file, because the API refuses `file://` pages. For an offline demo with no LLM, run `AI_ENGINE_DEMO=1 uvicorn main:app` and click *Load sample and analyze*. One page (`static/index.html`, no build step):
 
-1. **Company state:** the mock FintechX profile, editable as JSON.
-2. **Regulation:** paste text, or click *Load sample regulation*. Then click **Analyze gaps** (or press Cmd/Ctrl+Enter).
-3. **Findings:** counts by severity, then one colour-coded card per gap with the verbatim regulation quote, requirement, current state, gap and remediation. Gaps where the data is insufficient are marked separately.
-4. **Audit log:** **Generate audit log** renders the Markdown report, which you can download or copy.
+1. **Company state:** the mock FintechX profile shown as tiles, editable as JSON.
+2. **Regulation:** paste text, or click *Load sample* (or press `S`). Then click **Analyze gaps** (or press Cmd/Ctrl+Enter). While the model works, a progress panel shows the real elapsed time and the engine's stages. The stage ticks are illustrative, because the model call is a single request.
+3. **Findings:** a severity donut and counters (click one to filter), a clause-coverage strip, then one card per gap. Each card shows:
+   - the quote, with a badge from the server's `excerpt_match`: *Verified · verbatim*, *Partial quote*, *Unverified citation · closest clause (score)* or *No matching source*;
+   - its clause (labels understand `Section 4.1`, `(iv)` and `(v) c.` style numbering);
+   - the requirement side by side with the company fields from `state_fields`. Hovering a card highlights those fields in the company-state panel.
+4. **Clause coverage:** every clause of the regulation from `POST /api/coverage`, marked *Gap*, *Needs info* or **Not flagged** (hatched: the model raised nothing there, so review it by hand). A clause map and counters show, for example, "3 of 24 clauses assessed · 21 not flagged". Each clause links to its findings and its place in the source.
+5. **Source grounding:** the regulation text with each excerpt highlighted at the exact `excerpt_span` the server verified, and unflagged clauses hatched. Click a highlight to jump to it.
+6. **Audit log:** **Generate audit log** renders the Markdown report as a document marked *Draft · pending human review*, with who wrote it ("Drafted by <model> (LLM)" or "Rendered deterministically"). You can download it, copy it, print it to PDF or regenerate it.
 
-Optional provider, model and API key fields send the `X-LLM-*` headers. The key is never stored. The header dot shows whether the API is up.
+Optional provider, model and API key fields send the `X-LLM-*` headers. The key is never stored. The header shows API health and the requested model. An unknown model or bad server setting is reported as a setup problem, not as a missing key. It has a dark/light toggle (`T`). Press `?` to list the keyboard shortcuts.
 
 ### Setup and run
 
@@ -170,8 +175,9 @@ pytest -m live                        # real API: retention gap, compliant state
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, … | none | One per provider. Put them in a gitignored `.env` (see `.env.example`). Read at call time and never logged. |
 | `LLM_MODEL` / `<PROVIDER>_MODEL` | `claude-sonnet-5-5`, `gpt-5-mini`, `gemini-2.5-flash`, … | Override the default model. |
 | `LLM_BASE_URL`, `LLM_API_KEY` | none | For `LLM_PROVIDER=custom` (any OpenAI-compatible server). |
-| `LLM_TIMEOUT_SECONDS` | `60` | Per-read timeout. Requests are streamed. |
+| `LLM_TIMEOUT_SECONDS` | `60` | Per-read timeout. Claude requests are streamed, so this bounds the gap between chunks. OpenAI-compatible requests (including Ollama) are not streamed, so this bounds the whole generation; raise it for slow local models. Connecting gives up after 5 s. Cloud calls get one SDK retry and local Ollama none, so a call fails in at most about 2 x this value, and a stopped Ollama fails at once with a clear message. |
 | `LLM_EFFORT` | `medium` | `low` to `max`. |
+| `AI_ENGINE_DEMO` | off | `1` turns on **offline demo mode**. No LLM is called. The UI's sample regulation (with the default company profile) and the `python ai_engine.py` smoke test replay recorded findings through the real validation and grounding, and the audit log uses the deterministic renderer, labelled `offline-demo` in its header. Any other input returns a 502 that explains why. |
 
 ### API
 
@@ -184,14 +190,17 @@ uvicorn main:app --reload          # http://127.0.0.1:8000/docs
 | GET | `/health` | none | `{"status": "ok"}` |
 | GET | `/api/system-state` | none | the mock company profile (`mock_db.py`) |
 | POST | `/api/analyze-regulation` | `{"text": "...", "company_state": {...}?}` | list of anomalies |
-| POST | `/api/generate-audit` | `{"anomalies": [...]}` or `{"text": "...", "company_state": {...}?}` | `{"anomalies": [...], "markdown": "..."}` |
+| POST | `/api/generate-audit` | `{"anomalies": [...]}` or `{"text": "...", "company_state": {...}?}` | `{"anomalies": [...], "markdown": "...", "renderer": "llm" \| "deterministic", "model": "..." \| null}` |
+| POST | `/api/coverage` | `{"text": "...", "anomalies": [...]}` | `{"coverage": [{"id", "text", "span", "status", "finding_ids"}]}`, deterministic, no LLM |
 
 - **Your own key:** send it in the optional `X-LLM-Api-Key` header. `X-LLM-Provider` and `X-LLM-Model` are optional too, and `GET /api/providers` lists the providers. The older `X-Anthropic-Api-Key` header still works.
 - `company_state` defaults to the mock profile.
+- **CORS:** the UI is served from the API itself (same origin). Cross-origin calls are allowed only from `localhost`/`127.0.0.1` on any port, plus origins listed in `CORS_ALLOW_ORIGINS` (comma-separated). Pages opened from `file://` (origin `null`) are refused, so open the UI through `uvicorn` instead.
 - Errors return a `detail.error` code:
   - **422:** `INVALID_INPUT`, for bad input.
   - **401:** `LLM_AUTH`, when the key is missing or rejected.
-  - **502:** `LLM_UNAVAILABLE`, when the provider fails.
+  - **500:** `LLM_CONFIG`, when the server's LLM setup is wrong in a way a key won't fix (unknown model, invalid `LLM_*` setting).
+  - **502:** `LLM_UNAVAILABLE`, when the provider fails, can't be reached (e.g. Ollama isn't running) or times out.
 
 ### Contract for the API layer
 
@@ -202,9 +211,22 @@ anomalies = analyze_compliance_gap(regulation_text, company_state_dict, api_key=
 markdown  = generate_audit_trail(anomalies, api_key=user_key)                               # str
 ```
 
-- Each anomaly has exactly these keys: `id`, `title`, `category`, `severity`, `gap_type`, `regulation_requirement`, `regulation_excerpt`, `current_state`, `gap_description` and `recommended_remediation`. The list is sorted critical → low.
+- Each anomaly has these keys: `id`, `title`, `category`, `severity`, `gap_type`, `regulation_requirement`, `regulation_excerpt`, `current_state`, `gap_description` and `recommended_remediation`, plus the additive fields below. The list is sorted critical → low.
 - Both functions are synchronous. Call them from a plain `def` route, or use `run_in_threadpool`.
 - `ValueError` means bad input (HTTP 400/422).
-- `LLMConfigError` means a missing or rejected key (HTTP 401/500).
+- `LLMConfigError` means a missing or rejected key (HTTP 401). Its subclass `LLMSetupError` means a server-side setup problem such as an unknown model (HTTP 500).
 - Any other `LLMError` means the provider failed (HTTP 502).
 - No other exception type escapes.
+
+**Additive fields** (existing keys are unchanged):
+
+| Where | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| each anomaly | `excerpt_match` | `"exact"` \| `"fragment"` \| `"nearest"` \| `"none"` | How `regulation_excerpt` was matched to the regulation. `exact`: the model's quote was found verbatim. `fragment`: one `...`-separated part of it was found. `nearest`: not found, so the clause sharing the most words is cited (an unverified citation). `none`: nothing resembles it. The closest clause text is kept so the excerpt is still a real quote, but the citation should not be trusted. |
+| each anomaly | `excerpt_score` | float, 0–1 | `exact`: 1.0. `fragment`: the fraction of the quote found. `nearest`/`none`: the fraction of the quote's words found in the clause (`none` is below 0.3). |
+| each anomaly | `excerpt_span` | `[start, end]` \| `null` | Character offsets into the submitted regulation text (Python string indices, end exclusive), so `text[start:end] == regulation_excerpt`. `null` when `excerpt_match` is `"none"`. |
+| each anomaly | `state_fields` | list of strings | The company-state keys the finding refers to, with nested keys as dotted paths (`"security.encryption"`). Only keys that really exist in the submitted state are kept. |
+| `/api/generate-audit` | `renderer` | `"llm"` \| `"deterministic"` | Who wrote `markdown`: the model, or the deterministic renderer (no gaps, demo mode, or the model's log failed validation). |
+| `/api/generate-audit` | `model` | string \| `null` | The model called for this log (even if its output was rejected), or `null` when no model was called. |
+
+Headings (e.g. "Section 4.1 Data Retention.") and text addressed to an AI ("ignore all previous instructions") are never used as `nearest` candidates or coverage clauses. `ai_engine.build_coverage(regulation_text, anomalies)` returns clause-by-clause coverage: `[{"id": "CL-001", "text": "...", "span": [start, end], "status": "gap" | "needs_info" | "not_flagged", "finding_ids": ["ANOM-001", ...]}]`. Findings map to clauses through `excerpt_span`. `POST /api/coverage` serves it: send the regulation `text` and the `anomalies` returned for it. It is a separate endpoint because `/api/analyze-regulation` returns a bare list, so a top-level field couldn't be added there without breaking clients.

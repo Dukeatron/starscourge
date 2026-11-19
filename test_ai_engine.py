@@ -31,6 +31,7 @@ ISO = "2026-11-18T11:38:00Z"
 EXPECTED_KEYS = {
     "id", "title", "category", "severity", "gap_type", "regulation_requirement",
     "regulation_excerpt", "current_state", "gap_description", "recommended_remediation",
+    "state_fields", "excerpt_match", "excerpt_score", "excerpt_span",  # additive fields
 }
 
 
@@ -68,6 +69,12 @@ class FakeProvider:
         if isinstance(out, Exception):
             raise out
         return out
+
+
+@pytest.fixture(autouse=True)
+def fresh_learned_relaxations(monkeypatch):
+    """Parameter fallbacks learned from one test's fake provider must not leak into another."""
+    monkeypatch.setattr(ai_engine, "_learned_relaxations", {})
 
 
 @pytest.fixture
@@ -455,6 +462,19 @@ def test_persistent_output_error_is_capped_at_three_calls(provider):
     assert len(fake.calls) == 3
 
 
+def test_mixed_bad_json_and_schema_failures_share_one_budget_of_three_calls(provider):
+    fake = provider("garbage", {"anomalies": [make_anomaly(severity="urgent")]}, "garbage", "garbage")
+    with pytest.raises(LLMOutputError):
+        analyze_compliance_gap(REGULATION, STATE)
+    assert len(fake.calls) == 3  # was up to 9 (3 schema retries x 3 parse retries)
+
+
+def test_bad_json_then_schema_failure_then_valid_recovers(provider):
+    fake = provider("garbage", {"anomalies": [make_anomaly(severity="urgent")]}, {"anomalies": [make_anomaly()]})
+    assert len(analyze_compliance_gap(REGULATION, STATE)) == 1
+    assert len(fake.calls) == 3
+
+
 def test_audit_persistent_output_error_goes_to_fallback_after_three_calls(provider):
     fake = provider(LLMOutputError("truncated"))
     md = generate_audit_trail(anomalies_with_ids(), generated_at=GENERATED_AT)
@@ -564,7 +584,7 @@ def test_client_is_singleton_and_rebuilt_on_key_change(no_key, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "key-one")
     first = ai_engine._get_client()
     assert ai_engine._get_client() is first
-    assert first.max_retries == 3
+    assert first.max_retries == ai_engine.SDK_MAX_RETRIES == 1
     monkeypatch.setenv("ANTHROPIC_API_KEY", "key-two")
     assert ai_engine._get_client() is not first
 
@@ -729,6 +749,16 @@ def test_provider_detected_from_key_prefix(no_key, key, provider):
     assert ai_engine._resolve_provider(None, key) == provider
 
 
+def test_env_keys_alone_never_select_a_provider(no_key, monkeypatch):
+    """Matches .env.example: request provider, then key prefix, then LLM_PROVIDER, then ollama."""
+    monkeypatch.delenv("LLM_PROVIDER")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    assert ai_engine._resolve_provider() == "ollama"
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+    assert ai_engine._resolve_provider(None, "sk-ant-x") == "anthropic"
+    assert ai_engine._resolve_provider("openai", "sk-ant-x") == "openai"
+
+
 def test_explicit_provider_wins_over_key_prefix(no_key):
     assert ai_engine._resolve_provider("deepseek", "sk-abc") == "deepseek"
 
@@ -761,6 +791,48 @@ def test_ollama_default_model_falls_back_when_server_down(no_key, monkeypatch):
     monkeypatch.setattr(ai_engine, "_ollama_default", None)
     monkeypatch.setattr("urllib.request.urlopen", down)
     assert ai_engine._resolve_model("ollama") == ai_engine.OLLAMA_FALLBACK_MODEL
+
+
+def test_ollama_discovery_is_cached_and_refreshed_after_ttl(no_key, monkeypatch):
+    import io
+
+    probes = []
+    tags = {"models": [{"name": "small:3b", "size": 3}]}
+
+    def urlopen(url, timeout):
+        probes.append(url)
+        return io.BytesIO(json.dumps(tags).encode())
+
+    clock = [1000.0]
+    monkeypatch.setattr(ai_engine.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ai_engine, "_ollama_default", None)
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    assert ai_engine._resolve_model("ollama") == "small:3b"
+    assert ai_engine._resolve_model("ollama") == "small:3b"
+    assert len(probes) == 1 and probes[0].endswith("/api/tags") and "/v1" not in probes[0]
+    tags["models"].append({"name": "tiny:1b", "size": 1})
+    clock[0] += ai_engine.OLLAMA_MODEL_TTL_SECONDS + 1
+    assert ai_engine._resolve_model("ollama") == "tiny:1b"
+    assert len(probes) == 2
+
+
+def test_ollama_down_is_cached_briefly(no_key, monkeypatch):
+    probes = []
+
+    def down(url, timeout):
+        probes.append(url)
+        raise OSError("connection refused")
+
+    clock = [1000.0]
+    monkeypatch.setattr(ai_engine.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ai_engine, "_ollama_default", None)
+    monkeypatch.setattr("urllib.request.urlopen", down)
+    for _ in range(3):
+        assert ai_engine._resolve_model("ollama") == ai_engine.OLLAMA_FALLBACK_MODEL
+    assert len(probes) == 1
+    clock[0] += ai_engine.OLLAMA_DOWN_TTL_SECONDS + 1
+    ai_engine._resolve_model("ollama")
+    assert len(probes) == 2
 
 
 def test_unknown_provider_is_value_error(provider):
@@ -851,6 +923,31 @@ def test_openai_compatible_degrades_rejected_parameters():
     assert len(client.requests) == 4
 
 
+def test_rejected_parameters_are_remembered_per_provider_and_model():
+    errors = [
+        _bad_request("Unsupported value: 'temperature' does not support 0.0"),
+        _bad_request("response_format json_schema is not supported for this model"),
+    ]
+    first = FakeOpenAIClient('{"anomalies": []}', errors=errors)
+    ai_engine._openai_compatible_complete(first, "groq", "llama", "p", "s", True, ai_engine.ANALYSIS_SCHEMA, 0.0, 99)
+    assert len(first.requests) == 3
+
+    second = FakeOpenAIClient('{"anomalies": []}')
+    ai_engine._openai_compatible_complete(second, "groq", "llama", "p", "s", True, ai_engine.ANALYSIS_SCHEMA, 0.0, 99)
+    assert len(second.requests) == 1  # no failed round trips the second time
+    assert "temperature" not in second.requests[0]
+    assert second.requests[0]["response_format"] == {"type": "json_object"}
+
+    text_mode = FakeOpenAIClient("hello")
+    ai_engine._openai_compatible_complete(text_mode, "groq", "llama", "p", "", False, None, 0.0, 99)
+    assert "response_format" not in text_mode.requests[0] and "temperature" not in text_mode.requests[0]
+
+    other_model = FakeOpenAIClient('{"anomalies": []}')
+    ai_engine._openai_compatible_complete(other_model, "groq", "other", "p", "s", True, ai_engine.ANALYSIS_SCHEMA, 0.0, 99)
+    assert other_model.requests[0]["response_format"]["type"] == "json_schema"
+    assert other_model.requests[0]["temperature"] == 0.0
+
+
 def test_openai_compatible_unrelated_bad_request_is_llm_error():
     client = FakeOpenAIClient(errors=[_bad_request("context length exceeded")])
     with pytest.raises(LLMError):
@@ -879,6 +976,54 @@ def test_openai_compatible_rejected_key_is_config_error():
         ai_engine._openai_compatible_complete(client, "openai", "m", "p", "", False, None, 0.0, 10)
 
 
+def test_clients_fail_fast_on_connect_and_ollama_does_not_retry(no_key):
+    cloud = ai_engine._get_client("AIzaSyTEST", None)
+    assert cloud.timeout.connect == ai_engine.CONNECT_TIMEOUT_SECONDS
+    assert cloud.timeout.read == ai_engine.DEFAULT_TIMEOUT_SECONDS
+    assert cloud.max_retries == ai_engine.SDK_MAX_RETRIES
+    claude = ai_engine._get_client("sk-ant-test", None)
+    assert claude.timeout.connect == ai_engine.CONNECT_TIMEOUT_SECONDS
+    local = ai_engine._get_client(None, "ollama")
+    assert local.max_retries == 0
+
+
+def _connection_errors():
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "http://localhost:11434/v1/chat/completions")
+    refused = openai.APIConnectionError(request=request)
+    read_timeout = openai.APITimeoutError(request=request)
+    read_timeout.__cause__ = httpx.ReadTimeout("slow")
+    connect_timeout = openai.APITimeoutError(request=request)
+    connect_timeout.__cause__ = httpx.ConnectTimeout("unreachable")
+    return refused, read_timeout, connect_timeout
+
+
+def test_ollama_down_gives_an_actionable_message():
+    refused, _, connect_timeout = _connection_errors()
+    for err in (refused, connect_timeout):
+        client = FakeOpenAIClient(errors=[err])
+        with pytest.raises(LLMError, match="ollama serve") as info:
+            ai_engine._openai_compatible_complete(client, "ollama", "m", "p", "", False, None, 0.0, 10)
+        assert not isinstance(info.value, LLMConfigError)
+
+
+def test_read_timeout_names_the_setting(monkeypatch):
+    _, read_timeout, _ = _connection_errors()
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "45")
+    client = FakeOpenAIClient(errors=[read_timeout])
+    with pytest.raises(LLMError, match="within 45 seconds.*LLM_TIMEOUT_SECONDS"):
+        ai_engine._openai_compatible_complete(client, "groq", "m", "p", "", False, None, 0.0, 10)
+
+
+def test_cloud_connection_error_is_llm_error():
+    refused, _, _ = _connection_errors()
+    client = FakeOpenAIClient(errors=[refused])
+    with pytest.raises(LLMError, match="could not connect to openai"):
+        ai_engine._openai_compatible_complete(client, "openai", "m", "p", "", False, None, 0.0, 10)
+
+
 def test_end_to_end_through_openai_compatible_path(no_key, monkeypatch):
     payload = json.dumps({"anomalies": [make_anomaly()]})
     client = FakeOpenAIClient(payload)
@@ -898,6 +1043,182 @@ def test_dotenv_is_loaded_lazily_without_overriding(no_key, monkeypatch, tmp_pat
     ai_engine._load_dotenv()
     assert os.environ["GROQ_API_KEY"] == "gsk_from_file"
     assert os.environ["OPENAI_API_KEY"] == "from-env"
+
+
+# --------------------------------------------------------------------------- additive fields
+
+
+def test_schema_asks_for_state_fields():
+    item = ai_engine.ANALYSIS_SCHEMA["properties"]["anomalies"]["items"]
+    assert item["properties"]["state_fields"] == {"type": "array", "items": {"type": "string"}}
+    assert "state_fields" in item["required"]  # strict JSON-schema mode needs every property listed
+
+
+def test_state_fields_are_validated_against_real_keys(provider):
+    state = {"Data_Retention_Days": 30, "security": {"encryption": "AES-128"}, "dpo": False}
+    provider({"anomalies": [
+        make_anomaly(state_fields=["data_retention_days", "made_up_key", "security.encryption", 7]),
+        make_anomaly(title="Inferred", gap_description="g2", current_state="security.encryption = AES-128; dpo = false"),
+        make_anomaly(title="Malformed", gap_description="g3", state_fields={"not": "a list"}, current_state="none"),
+    ]})
+    by_title = {a["title"]: a for a in analyze_compliance_gap(REGULATION, state)}
+    assert by_title["Data retention period too short"]["state_fields"] == ["Data_Retention_Days", "security.encryption"]
+    assert by_title["Inferred"]["state_fields"] == ["security.encryption", "dpo"]  # state order, not "security"
+    assert by_title["Malformed"]["state_fields"] == []
+
+
+def test_state_fields_are_not_inferred_from_the_not_specified_sentinel(provider):
+    state = {"company": "FintechX", "state": "CA", "data_retention_days": 30}
+    provider({"anomalies": [make_anomaly(gap_type="insufficient_information", current_state="whatever")]})
+    [a] = analyze_compliance_gap(REGULATION, state)
+    assert a["current_state"] == ai_engine.NOT_SPECIFIED and a["state_fields"] == []
+
+
+def test_findings_carry_excerpt_metadata(provider):
+    provider({"anomalies": [
+        make_anomaly(),
+        make_anomaly(title="Paraphrased", gap_description="g2", regulation_excerpt="appoint DPO officer entity"),
+        make_anomaly(title="Invented", gap_description="g3", regulation_excerpt="zebra quantum lattice"),
+    ]})
+    by_title = {a["title"]: a for a in analyze_compliance_gap(REGULATION, STATE)}
+    exact = by_title["Data retention period too short"]
+    assert exact["excerpt_match"] == "exact" and exact["excerpt_score"] == 1.0
+    start, end = exact["excerpt_span"]
+    assert REGULATION[start:end] == exact["regulation_excerpt"]
+    near = by_title["Paraphrased"]
+    assert near["excerpt_match"] == "nearest" and isinstance(near["excerpt_span"], list)
+    assert "Data Protection Officer" in near["regulation_excerpt"]
+    invented = by_title["Invented"]
+    assert invented["excerpt_match"] == "none" and invented["excerpt_span"] is None
+    assert invented["regulation_excerpt"] in REGULATION
+    assert all(isinstance(a["excerpt_score"], float) for a in by_title.values())
+
+
+def test_audit_report_says_who_wrote_the_log(provider, no_key):
+    anoms = anomalies_with_ids()
+    provider(good_markdown(anoms))
+    llm = ai_engine.generate_audit_report(anoms, generated_at=GENERATED_AT, api_key="sk-ant-x", model="claude-x")
+    assert (llm["renderer"], llm["model"]) == ("llm", "claude-x")
+    assert llm["markdown"] == generate_audit_trail(anoms, generated_at=GENERATED_AT, api_key="sk-ant-x", model="claude-x")
+
+    provider("not a valid log")
+    fallback = ai_engine.generate_audit_report(anoms, generated_at=GENERATED_AT, api_key="sk-ant-x", model="claude-x")
+    assert (fallback["renderer"], fallback["model"]) == ("deterministic", "claude-x")  # called, but its log was rejected
+
+    empty = ai_engine.generate_audit_report([], generated_at=GENERATED_AT)
+    assert (empty["renderer"], empty["model"]) == ("deterministic", None)  # no LLM called
+    assert set(empty) == {"markdown", "renderer", "model"}
+
+
+def test_audit_accepts_findings_with_the_additive_fields(provider):
+    provider(json.dumps({"anomalies": [make_anomaly()]}), "not a valid log")
+    found = analyze_compliance_gap(REGULATION, STATE)
+    md = generate_audit_trail(found, generated_at=GENERATED_AT)
+    assert "### ANOM-001" in md and "excerpt_span" not in md
+
+
+# --------------------------------------------------------------------------- HTML escaping
+
+_XSS = '<img src=x onerror="alert(1)">'
+
+
+def test_fallback_audit_escapes_html_from_untrusted_fields(provider):
+    provider("not a valid log")  # forces the deterministic renderer
+    anoms = [{"id": "ANOM-001", **make_anomaly(
+        title="Retention " + _XSS, regulation_excerpt="records " + _XSS,
+        current_state="<script>x</script>", recommended_remediation="Fix <b>it</b>.",
+    )}]
+    md = generate_audit_trail(anoms, generated_at=GENERATED_AT)
+    assert "<" not in md
+    assert "&lt;img src=x onerror" in md and "&lt;script>" in md
+    assert md.startswith("# Compliance Audit Log") and "### ANOM-001" in md
+
+
+def test_llm_written_audit_is_escaped_too(provider):
+    anoms = anomalies_with_ids()
+    md_in = good_markdown(anoms).replace("## 4. Audit Trail", _XSS + "\n\n## 4. Audit Trail")
+    provider(md_in)
+    md = generate_audit_trail(anoms, generated_at=GENERATED_AT)
+    assert "<img" not in md and "&lt;img" in md
+
+
+def test_no_gaps_log_has_no_raw_html(provider):
+    provider("unused")
+    assert "<" not in generate_audit_trail([], generated_at=GENERATED_AT)
+
+
+# --------------------------------------------------------------------------- offline demo mode
+
+
+def test_demo_mode_smoke_pair_end_to_end_without_any_provider(no_key, monkeypatch):
+    monkeypatch.setenv("AI_ENGINE_DEMO", "1")
+    monkeypatch.setattr(ai_engine, "_provider_complete", FakeProvider(AssertionError("no LLM in demo mode")))
+    found = analyze_compliance_gap(REGULATION, STATE)
+    assert [a["severity"] for a in found] == ["critical", "high", "high", "medium"]
+    assert all(set(a) == EXPECTED_KEYS and a["regulation_excerpt"] in REGULATION for a in found)
+    md = generate_audit_trail(found, generated_at=GENERATED_AT)
+    assert _audit_is_valid(md, ISO, ai_engine._normalize_audit_items(found))
+    assert "offline-demo" in md
+    assert "offline-demo" in generate_audit_trail([], generated_at=GENERATED_AT)
+
+
+def test_demo_mode_is_off_by_default_and_unknown_input_is_llm_error(provider, monkeypatch):
+    fake = provider('{"anomalies": []}')
+    assert analyze_compliance_gap(REGULATION, STATE) == [] and len(fake.calls) == 1
+    monkeypatch.setenv("AI_ENGINE_DEMO", "true")
+    with pytest.raises(LLMError, match="AI_ENGINE_DEMO"):
+        analyze_compliance_gap(REGULATION, {"other": 1})
+    with pytest.raises(ValueError):  # input validation still runs first
+        analyze_compliance_gap("", STATE)
+    assert len(fake.calls) == 1
+
+
+# --------------------------------------------------------------------------- grounding
+
+
+def _reference_closest_sentence(excerpt: str, regulation: str) -> str:
+    """The original brute-force fallback: rank every sentence by (word overlap, difflib ratio)."""
+    import difflib
+
+    norm_ex = ai_engine._normalized_with_map(excerpt)[0].strip().strip("\"'…. ")
+    # Candidates are the filtered clauses (headings and injection text excluded).
+    sentences = [c.text for c in ai_engine._RegulationIndex(regulation).clauses()]
+    target = set(ai_engine._WORD_RE.findall(norm_ex))
+    best, best_score = sentences[0], (-1.0, -1.0)
+    for sentence in sentences:
+        norm = ai_engine._normalized_with_map(sentence)[0]
+        words = set(ai_engine._WORD_RE.findall(norm))
+        overlap = len(target & words) / len(target) if target else 0.0
+        score = (overlap, difflib.SequenceMatcher(None, norm_ex, norm, autojunk=False).ratio())
+        if score > best_score:
+            best, best_score = sentence, score
+    return ai_engine._truncate_verbatim(best, ai_engine.MAX_EXCERPT_CHARS)
+
+
+def test_closest_sentence_fallback_matches_brute_force_reference():
+    import random
+
+    rng = random.Random(3)
+    vocab = "entity must retain records breach notify regulator hours encryption access review officer".split()
+    regulation = "\n".join(
+        f"{i}. " + " ".join(rng.choice(vocab) for _ in range(rng.randint(4, 12))).capitalize() + "."
+        for i in range(60)
+    )
+    index = ai_engine._RegulationIndex(regulation)
+    for _ in range(40):
+        # "zzz" never occurs in the regulation, so this always takes the closest-sentence fallback.
+        paraphrase = " ".join(rng.choice(vocab + ["qqq"]) for _ in range(rng.randint(0, 8))) + " zzz"
+        assert index.ground(paraphrase).text == _reference_closest_sentence(paraphrase, regulation)
+
+
+def test_normalization_handles_unicode_quotes_dashes_and_spaces():
+    text = "The Entity’s “DPO” — appointed within  72 HOURS. Ärzte"
+    norm, index = ai_engine._normalized_with_map(text)
+    assert norm == "the entity's \"dpo\" - appointed within 72 hours. ärzte"
+    assert len(norm) == len(index) and all(text[i] for i in index)
+    grounded = ai_engine._RegulationIndex(text).ground('the entity\'s "dpo" - appointed within 72 hours')
+    assert grounded.match == "exact" and text[slice(*grounded.span)] == grounded.text
+    assert grounded.text == "The Entity’s “DPO” — appointed within  72 HOURS"
 
 
 # --------------------------------------------------------------------------- live tests

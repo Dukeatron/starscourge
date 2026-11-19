@@ -63,8 +63,9 @@ ANALYSIS_SCHEMA: dict = {
                     "current_state": {"type": "string"},
                     "gap_description": {"type": "string"},
                     "recommended_remediation": {"type": "string"},
+                    "state_fields": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": list(ANOMALY_ITEM_FIELDS),
+                "required": list(ANOMALY_ITEM_FIELDS) + ["state_fields"],
                 "additionalProperties": False,
             },
         }
@@ -96,7 +97,8 @@ Field guidance for each anomaly:
 - regulation_excerpt: a short verbatim quote (at most 200 characters) copied exactly from the regulation text that supports this finding. Do not paraphrase it.
 - current_state: what the company state says, citing the key and value (e.g. "data_retention_days = 30"), or "Not specified in company state".
 - gap_description: the specific gap, quantitative where possible.
-- recommended_remediation: 1 to 3 sentences with a concrete action."""
+- recommended_remediation: 1 to 3 sentences with a concrete action.
+- state_fields: the company_state keys this finding is about, written exactly as in <company_state> (nested keys as dotted paths, e.g. "security.encryption"); [] if the state has no relevant key."""
 
 
 def build_analysis_prompt(regulation_text: str, company_state_json: str) -> str:

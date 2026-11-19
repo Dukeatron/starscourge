@@ -9,24 +9,41 @@ config only, so callers cannot point the server at arbitrary hosts.
 """
 
 import logging
+import os
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pathlib import Path
 
-from ai_engine import PROVIDERS, LLMConfigError, LLMError, analyze_compliance_gap, generate_audit_trail
+from ai_engine import (
+    PROVIDERS,
+    LLMConfigError,
+    LLMError,
+    LLMSetupError,
+    analyze_compliance_gap,
+    build_coverage,
+    generate_audit_report as engine_audit_report,
+)
 from mock_db import get_compliance_state
-from models import AuditGenerationRequest, RegulationAnalysisRequest
+from models import AuditGenerationRequest, CoverageRequest, RegulationAnalysisRequest
 
 logger = logging.getLogger("api")
 
 app = FastAPI(title="Compliance Copilot API")
 
+# The UI is served from this app (same origin, no CORS needed). Cross-origin access is
+# limited to local dev servers on any port, plus any origins listed in CORS_ALLOW_ORIGINS
+# (comma-separated), so an arbitrary website cannot drive this unauthenticated API from a
+# visitor's browser.
+LOCAL_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
+EXTRA_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=EXTRA_ORIGINS,
+    allow_origin_regex=LOCAL_ORIGIN_REGEX,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,11 +56,19 @@ MODEL_HEADER = "X-LLM-Model"
 
 
 def _call_engine(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """Run an engine function and map its errors to HTTP status codes."""
+    """Run an engine function and map its errors to HTTP status codes.
+
+    ValueError -> 422 INVALID_INPUT; missing or rejected key -> 401 LLM_AUTH; server-side
+    LLM setup (unknown model, bad LLM_* env) -> 500 LLM_CONFIG; any other LLMError (provider
+    down, timeout, unusable output) -> 502 LLM_UNAVAILABLE. Messages never contain keys.
+    """
     try:
         return function(*args, **kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"error": "INVALID_INPUT", "message": str(exc)})
+    except LLMSetupError as exc:
+        logger.warning("LLM setup error: %s", exc)
+        raise HTTPException(status_code=500, detail={"error": "LLM_CONFIG", "message": str(exc)})
     except LLMConfigError as exc:
         raise HTTPException(
             status_code=401,
@@ -116,11 +141,24 @@ def generate_audit_report(request: AuditGenerationRequest, llm: dict = Depends(l
     """Generate the Markdown audit log.
 
     Pass the `anomalies` returned by /api/analyze-regulation to avoid a second analysis;
-    otherwise `text` is analyzed first. Returns {"anomalies": [...], "markdown": "..."}.
+    otherwise `text` is analyzed first. Returns {"anomalies": [...], "markdown": "...",
+    "renderer": "llm" | "deterministic", "model": str | null}.
     """
     anomalies = request.anomalies
     if anomalies is None:
         state = request.company_state if request.company_state is not None else get_compliance_state()
         anomalies = _call_engine(analyze_compliance_gap, request.text, state, **llm)
-    markdown = _call_engine(generate_audit_trail, anomalies, **llm)
-    return {"anomalies": anomalies, "markdown": markdown}
+    report = _call_engine(engine_audit_report, anomalies, **llm)
+    # "renderer" and "model" are additive: "llm" | "deterministic", and the model called (or null).
+    return {"anomalies": anomalies, "markdown": report["markdown"], "renderer": report["renderer"], "model": report["model"]}
+
+
+@app.post("/api/coverage")
+def coverage(request: CoverageRequest):
+    """Clause-by-clause coverage of the regulation by the findings. Deterministic, no LLM.
+
+    Send the regulation `text` and the `anomalies` that /api/analyze-regulation returned for
+    it. Returns {"coverage": [{"id": "CL-001", "text": "...", "span": [start, end],
+    "status": "gap" | "needs_info" | "not_flagged", "finding_ids": ["ANOM-001", ...]}]}.
+    """
+    return {"coverage": _call_engine(build_coverage, request.text, request.anomalies)}

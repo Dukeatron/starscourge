@@ -5,6 +5,10 @@ Public contract (imported by the API layer):
     from ai_engine import analyze_compliance_gap, generate_audit_trail, LLMError
 
 All functions are synchronous and return plain JSON-serializable Python objects.
+Errors: ValueError for bad input; LLMConfigError for a missing or rejected key (its
+subclass LLMSetupError for setup a key will not fix, such as an unknown model); any
+other LLMError when the provider fails, cannot be reached or returns unusable output.
+No other exception type escapes.
 
 Bring your own key and model: every public function takes optional keyword-only
 `api_key`, `provider` and `model`. Providers: anthropic (native Claude API) plus any
@@ -19,27 +23,28 @@ at import time, and keys are never logged:
     LLM_MODEL             optional; per provider: <PROVIDER>_MODEL (e.g. GEMINI_MODEL)
     ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
     DEEPSEEK_API_KEY, MISTRAL_API_KEY, XAI_API_KEY, TOGETHER_API_KEY, LLM_API_KEY (custom)
-    LLM_TIMEOUT_SECONDS   optional, default 60
+    LLM_TIMEOUT_SECONDS   optional, default 60 (per read; connecting gives up after 5 s)
     LLM_EFFORT            optional (Claude only: low | medium | high | xhigh | max), default "medium"
 """
 
 from __future__ import annotations
 
-import difflib
 import hashlib
 import json
 import logging
 import os
 import re
 import threading
-import unicodedata
+import time
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal, NamedTuple, TypeVar
 
 import anthropic
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
+import demo_fixtures
+import grounding
 from prompts import (
     ANALYSIS_SCHEMA,
     ANALYSIS_SYSTEM_PROMPT,
@@ -53,20 +58,30 @@ from prompts import (
 __all__ = [
     "LLMError",
     "LLMConfigError",
+    "LLMSetupError",
     "LLMOutputError",
     "call_llm",
     "analyze_compliance_gap",
     "generate_audit_trail",
+    "generate_audit_report",
+    "build_coverage",
     "PROVIDERS",
 ]
 
 logger = logging.getLogger("ai_engine")
+T = TypeVar("T")
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_EFFORT = "medium"
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-SDK_MAX_RETRIES = 3
+CONNECT_TIMEOUT_SECONDS = 5.0  # an unreachable host fails in seconds, not LLM_TIMEOUT_SECONDS
+# One SDK retry rides out a transient 429, 5xx or dropped connection. More would multiply
+# the worst case: each retried read timeout waits the full LLM_TIMEOUT_SECONDS again.
+SDK_MAX_RETRIES = 1
+# Local Ollama has no rate limits or flaky network to ride out, and retrying a read
+# timeout would re-run the whole (slow) local generation, so it fails at once.
+LOCAL_MAX_RETRIES = 0
 MAX_ATTEMPTS = 3  # total attempts on unusable output
 AUDIT_ATTEMPTS = 2  # LLM attempts for the audit log before the deterministic fallback
 DEFAULT_MAX_TOKENS = 16000  # room for adaptive thinking plus up to 25 findings
@@ -74,7 +89,7 @@ DEFAULT_MAX_TOKENS = 16000  # room for adaptive thinking plus up to 25 findings
 MAX_REGULATION_CHARS = 100_000
 MAX_STATE_CHARS = 20_000
 MAX_TITLE_CHARS = 80
-MAX_EXCERPT_CHARS = 200
+MAX_EXCERPT_CHARS = grounding.MAX_EXCERPT_CHARS
 NOT_SPECIFIED = "Not specified in company state"
 
 # Server-side refusal fallback: if the model declines, the API re-runs the request on
@@ -82,7 +97,9 @@ NOT_SPECIFIED = "Not specified in company state"
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-OUTPUT_KEYS = ("id",) + ANOMALY_ITEM_FIELDS
+OUTPUT_KEYS = ("id",) + ANOMALY_ITEM_FIELDS  # the original contract; the audit prompt sends these
+# Additive per-finding fields (owner-approved): appended after OUTPUT_KEYS.
+ADDITIVE_FIELDS = ("state_fields", "excerpt_match", "excerpt_score", "excerpt_span")
 
 
 # --------------------------------------------------------------------------- errors
@@ -94,6 +111,12 @@ class LLMError(RuntimeError):
 
 class LLMConfigError(LLMError):
     """Missing API key or bad configuration."""
+
+
+class LLMSetupError(LLMConfigError):
+    """Configuration that a different API key would not fix: an unknown model, an invalid
+    LLM_* environment variable, or a missing dependency. A subclass of LLMConfigError, so
+    existing handlers still catch it; the API reports it as a server error, not as 401."""
 
 
 class LLMOutputError(LLMError):
@@ -110,42 +133,48 @@ def _timeout_seconds() -> float:
     try:
         value = float(raw)
     except ValueError:
-        raise LLMConfigError("LLM_TIMEOUT_SECONDS must be a number") from None
+        raise LLMSetupError("LLM_TIMEOUT_SECONDS must be a number") from None
     if value <= 0:
-        raise LLMConfigError("LLM_TIMEOUT_SECONDS must be positive")
+        raise LLMSetupError("LLM_TIMEOUT_SECONDS must be positive")
     return value
 
 
 def _effort() -> str:
     raw = os.environ.get("LLM_EFFORT", "").strip().lower() or DEFAULT_EFFORT
     if raw not in VALID_EFFORTS:
-        raise LLMConfigError(f"LLM_EFFORT must be one of {', '.join(VALID_EFFORTS)}")
+        raise LLMSetupError(f"LLM_EFFORT must be one of {', '.join(VALID_EFFORTS)}")
     return raw
 
 
 # --------------------------------------------------------------------------- providers
 
-# OpenAI-compatible providers: name -> (base URL, key env vars, default model).
-# Every default model can be overridden with model=, <PROVIDER>_MODEL or LLM_MODEL.
-_OPENAI_COMPATIBLE: dict[str, tuple[str | None, tuple[str, ...], str]] = {
-    "openai": (None, ("OPENAI_API_KEY",), "gpt-5-mini"),
-    "gemini": (
+class _ProviderSpec(NamedTuple):
+    base_url: str | None  # None: the SDK default (OpenAI) or LLM_BASE_URL (custom)
+    key_env_vars: tuple[str, ...]
+    default_model: str  # "": discovered (ollama) or required from config (custom)
+
+
+# OpenAI-compatible providers. Every default model can be overridden with model=,
+# <PROVIDER>_MODEL or LLM_MODEL, and every base URL with <PROVIDER>_BASE_URL.
+_OPENAI_COMPATIBLE: dict[str, _ProviderSpec] = {
+    "openai": _ProviderSpec(None, ("OPENAI_API_KEY",), "gpt-5-mini"),
+    "gemini": _ProviderSpec(
         "https://generativelanguage.googleapis.com/v1beta/openai/",
         ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         "gemini-2.5-flash",
     ),
-    "groq": ("https://api.groq.com/openai/v1", ("GROQ_API_KEY",), "llama-3.3-70b-versatile"),
-    "openrouter": ("https://openrouter.ai/api/v1", ("OPENROUTER_API_KEY",), "openrouter/auto"),
-    "deepseek": ("https://api.deepseek.com", ("DEEPSEEK_API_KEY",), "deepseek-chat"),
-    "mistral": ("https://api.mistral.ai/v1", ("MISTRAL_API_KEY",), "mistral-large-latest"),
-    "xai": ("https://api.x.ai/v1", ("XAI_API_KEY",), "grok-4"),
-    "together": (
+    "groq": _ProviderSpec("https://api.groq.com/openai/v1", ("GROQ_API_KEY",), "llama-3.3-70b-versatile"),
+    "openrouter": _ProviderSpec("https://openrouter.ai/api/v1", ("OPENROUTER_API_KEY",), "openrouter/auto"),
+    "deepseek": _ProviderSpec("https://api.deepseek.com", ("DEEPSEEK_API_KEY",), "deepseek-chat"),
+    "mistral": _ProviderSpec("https://api.mistral.ai/v1", ("MISTRAL_API_KEY",), "mistral-large-latest"),
+    "xai": _ProviderSpec("https://api.x.ai/v1", ("XAI_API_KEY",), "grok-4"),
+    "together": _ProviderSpec(
         "https://api.together.xyz/v1",
         ("TOGETHER_API_KEY",),
         "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     ),
-    "ollama": ("http://localhost:11434/v1", ("OLLAMA_API_KEY",), ""),  # default: smallest installed model
-    "custom": (None, ("LLM_API_KEY",), ""),  # any OpenAI-compatible server: set LLM_BASE_URL + LLM_MODEL
+    "ollama": _ProviderSpec("http://localhost:11434/v1", ("OLLAMA_API_KEY",), ""),  # default: smallest installed model
+    "custom": _ProviderSpec(None, ("LLM_API_KEY",), ""),  # any OpenAI-compatible server: set LLM_BASE_URL + LLM_MODEL
 }
 PROVIDERS: tuple[str, ...] = ("anthropic",) + tuple(_OPENAI_COMPATIBLE)
 _ANTHROPIC_KEY_ENV = ("ANTHROPIC_API_KEY",)
@@ -192,7 +221,7 @@ def _load_dotenv() -> None:
 
 
 def _key_env_vars(provider: str) -> tuple[str, ...]:
-    return _ANTHROPIC_KEY_ENV if provider == "anthropic" else _OPENAI_COMPATIBLE[provider][1]
+    return _ANTHROPIC_KEY_ENV if provider == "anthropic" else _OPENAI_COMPATIBLE[provider].key_env_vars
 
 
 def _env_key(provider: str) -> str:
@@ -205,7 +234,12 @@ def _env_key(provider: str) -> str:
 
 DEFAULT_PROVIDER = "ollama"  # local models by default: no key, no cost, no data leaves the machine
 OLLAMA_FALLBACK_MODEL = "qwen2.5vl:3b"
-_ollama_default: str | None = None
+OLLAMA_TAGS_TIMEOUT_SECONDS = 2.0
+OLLAMA_MODEL_TTL_SECONDS = 300.0  # re-read the installed models every 5 minutes
+OLLAMA_DOWN_TTL_SECONDS = 10.0  # after a failed probe, skip probing for 10 seconds
+# Cached discovery result: (smallest installed model, or None if the probe failed, expiry
+# on the time.monotonic() clock). None means "not probed yet".
+_ollama_default: tuple[str | None, float] | None = None
 
 
 def _env_provider() -> str:
@@ -214,31 +248,43 @@ def _env_provider() -> str:
     configured = os.environ.get("LLM_PROVIDER", "").strip().lower()
     if configured:
         if configured not in PROVIDERS:
-            raise LLMConfigError(f"LLM_PROVIDER must be one of {', '.join(PROVIDERS)}")
+            raise LLMSetupError(f"LLM_PROVIDER must be one of {', '.join(PROVIDERS)}")
         return configured
     return DEFAULT_PROVIDER
 
 
 def _smallest_ollama_model() -> str:
-    """Smallest model installed on the local Ollama server (cached), else OLLAMA_FALLBACK_MODEL."""
+    """Smallest model installed on the local Ollama server, else OLLAMA_FALLBACK_MODEL.
+
+    The /api/tags lookup is cached: a hit for OLLAMA_MODEL_TTL_SECONDS (so newly pulled
+    models are picked up), a failed probe for OLLAMA_DOWN_TTL_SECONDS (so a stopped server
+    costs one probe, not one per call).
+    """
     global _ollama_default
-    if _ollama_default:
-        return _ollama_default
+    now = time.monotonic()
+    cached = _ollama_default
+    if cached is not None and now < cached[1]:
+        return cached[0] or OLLAMA_FALLBACK_MODEL
+    found = _probe_ollama_models()
+    ttl = OLLAMA_MODEL_TTL_SECONDS if found else OLLAMA_DOWN_TTL_SECONDS
+    _ollama_default = (found, now + ttl)
+    return found or OLLAMA_FALLBACK_MODEL
+
+
+def _probe_ollama_models() -> str | None:
+    """Ask the Ollama server for its installed models; the smallest one's name, or None."""
     import urllib.request
 
-    base = (_resolve_base_url("ollama") or "http://localhost:11434/v1").rstrip("/")
-    root = base[: -len("/v1")] if base.endswith("/v1") else base
+    root = str(_resolve_base_url("ollama")).rstrip("/").removesuffix("/v1")
     try:
-        with urllib.request.urlopen(root + "/api/tags", timeout=2) as response:
+        with urllib.request.urlopen(root + "/api/tags", timeout=OLLAMA_TAGS_TIMEOUT_SECONDS) as response:
             models = json.load(response).get("models") or []
         sized = [(int(m.get("size") or 0), str(m.get("name") or m.get("model"))) for m in models]
         sized = [m for m in sized if m[0] > 0 and m[1] and m[1] != "None"]
-        if sized:
-            _ollama_default = min(sized)[1]
-            return _ollama_default
-    except Exception:  # server down or unexpected payload: use the fallback, retry next call
-        pass
-    return OLLAMA_FALLBACK_MODEL
+        return min(sized)[1] if sized else None
+    except Exception:  # server down or unexpected payload: the caller uses the fallback
+        logger.info("ollama model discovery failed; using %s", OLLAMA_FALLBACK_MODEL)
+        return None
 
 
 def _check_llm_args(api_key: Any, provider: Any = None, model: Any = None) -> None:
@@ -250,9 +296,6 @@ def _check_llm_args(api_key: Any, provider: Any = None, model: Any = None) -> No
             raise ValueError(f"provider must be one of {', '.join(PROVIDERS)}")
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ValueError("model must be a non-empty string or None")
-
-
-_check_api_key = _check_llm_args  # backward-compatible name
 
 
 def _resolve_provider(provider: str | None = None, api_key: str | None = None) -> str:
@@ -279,9 +322,9 @@ def _resolve_model(provider: str, model: str | None = None) -> str:
         return DEFAULT_MODEL
     if provider == "ollama":
         return _smallest_ollama_model()
-    default = _OPENAI_COMPATIBLE[provider][2]
+    default = _OPENAI_COMPATIBLE[provider].default_model
     if not default:
-        raise LLMConfigError("provider 'custom' needs a model: pass model= or set LLM_MODEL")
+        raise LLMSetupError("provider 'custom' needs a model: pass model= or set LLM_MODEL")
     return default
 
 
@@ -293,12 +336,18 @@ def _resolve_base_url(provider: str) -> str | None:
     if provider == "custom":
         override = override or os.environ.get("LLM_BASE_URL", "").strip()
         if not override:
-            raise LLMConfigError("provider 'custom' needs LLM_BASE_URL")
-    return override or _OPENAI_COMPATIBLE[provider][0]
+            raise LLMSetupError("provider 'custom' needs LLM_BASE_URL")
+    return override or _OPENAI_COMPATIBLE[provider].base_url
 
 
-def _model_name() -> str:
-    """Model used when the caller passes no provider or model (for display)."""
+def _model_label(api_key: str | None, provider: str | None, model: str | None) -> str:
+    """The model name shown in the audit log header. Never raises: a configuration error
+    surfaces from the LLM call itself, and the no-gaps log needs no LLM at all."""
+    try:
+        return _resolve_model(_resolve_provider(provider, api_key), model)
+    except LLMConfigError:
+        if model:
+            return model
     try:
         return _resolve_model(_env_provider())
     except LLMConfigError:
@@ -335,20 +384,50 @@ def _get_client(api_key: str | None = None, provider: str | None = None) -> Any:
         if client is not None:
             _clients.move_to_end(cache_key)
             return client
+        # Per-read timeout as configured, but give up on connecting much sooner. Each SDK
+        # takes its own Timeout type (they may be built on different httpx versions).
+        connect = min(timeout, CONNECT_TIMEOUT_SECONDS)
         if name == "anthropic":
-            client = anthropic.Anthropic(api_key=key, timeout=timeout, max_retries=SDK_MAX_RETRIES)
+            client = anthropic.Anthropic(
+                api_key=key, timeout=anthropic.Timeout(timeout, connect=connect), max_retries=SDK_MAX_RETRIES
+            )
         else:
             try:
                 import openai
             except ImportError:
-                raise LLMConfigError(f"provider '{name}' needs the openai package: pip install openai") from None
+                raise LLMSetupError(f"provider '{name}' needs the openai package: pip install openai") from None
             client = openai.OpenAI(
-                api_key=key, base_url=base_url, timeout=timeout, max_retries=SDK_MAX_RETRIES
+                api_key=key, base_url=base_url, timeout=openai.Timeout(timeout, connect=connect),
+                max_retries=LOCAL_MAX_RETRIES if name == "ollama" else SDK_MAX_RETRIES,
             )
         _clients[cache_key] = client
         while len(_clients) > _MAX_CACHED_CLIENTS:
             _clients.popitem(last=False)
         return client
+
+
+def _connection_error(provider: str, exc: Exception, timeout_type: type) -> LLMError:
+    """A clear, secret-free LLMError for a provider that could not be reached or timed out.
+
+    `timeout_type` is the SDK's APITimeoutError. A timeout while connecting (the httpx
+    cause is a ConnectTimeout) is reported as "could not connect", not as a slow model.
+    """
+    connect_timeout = type(exc.__cause__).__name__ == "ConnectTimeout"
+    if isinstance(exc, timeout_type) and not connect_timeout:
+        try:
+            limit = f"{_timeout_seconds():g}"
+        except LLMConfigError:
+            limit = "the configured"
+        return LLMError(
+            f"{provider} did not respond within {limit} seconds; "
+            "try a smaller model or raise LLM_TIMEOUT_SECONDS"
+        )
+    if provider == "ollama":
+        return LLMError(
+            "could not connect to the local Ollama server: start it with `ollama serve` "
+            "and pull a model (`ollama pull qwen2.5:3b`), or choose another provider and pass its API key"
+        )
+    return LLMError(f"could not connect to {provider}; check the network and try again")
 
 
 def _provider_complete(
@@ -362,7 +441,7 @@ def _provider_complete(
     api_key: str | None = None,
     provider: str | None = None,
     model: str | None = None,
-) -> dict | str:
+) -> str:
     """The only function that touches provider SDKs. Returns the raw response text."""
     name = _resolve_provider(provider, api_key)
     model_name = _resolve_model(name, model)
@@ -407,9 +486,11 @@ def _anthropic_complete(
     except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
         raise LLMConfigError(f"the API key was rejected by the provider ({type(exc).__name__})") from exc
     except anthropic.NotFoundError as exc:
-        raise LLMConfigError(f"model '{model_name}' not found") from exc
+        raise LLMSetupError(f"model '{model_name}' not found") from exc
     except anthropic.APIStatusError as exc:
         raise LLMError(f"provider error: HTTP {exc.status_code} ({type(exc).__name__})") from exc
+    except anthropic.APIConnectionError as exc:  # includes APITimeoutError
+        raise _connection_error("anthropic", exc, anthropic.APITimeoutError) from exc
     except anthropic.AnthropicError as exc:
         raise LLMError(f"provider error: {type(exc).__name__}") from exc
 
@@ -423,6 +504,50 @@ def _anthropic_complete(
     if not text.strip():
         raise LLMOutputError("model returned no text")
     return text
+
+
+# Request parameters that some OpenAI-compatible providers or models reject, and the
+# simpler request to try instead. Each step is applied only if it fits the request.
+_MAX_REQUESTS_PER_CALL = 5  # the original request plus up to four relaxations
+_MAX_LEARNED_MODELS = 256
+_learned_relaxations: dict[tuple[str, str], list[str]] = {}
+_learned_lock = threading.Lock()
+
+
+def _relaxation_for(kwargs: dict[str, Any], detail: str) -> str | None:
+    """The relaxation that answers a BadRequestError message, or None if it is unrelated."""
+    if "temperature" in kwargs and "temperature" in detail:
+        return "drop_temperature"
+    if "max_tokens" in kwargs and "max_tokens" in detail:
+        return "use_max_completion_tokens"
+    if "max_completion_tokens" in kwargs and "max_completion_tokens" in detail:
+        return "use_max_tokens"
+    if "response_format" in kwargs and any(w in detail for w in ("response_format", "json", "schema")):
+        return "json_object" if kwargs["response_format"]["type"] == "json_schema" else "drop_response_format"
+    return None
+
+
+def _apply_relaxation(kwargs: dict[str, Any], step: str) -> None:
+    """Simplify the request in place; a step that does not fit this request is skipped."""
+    if step == "drop_temperature":
+        kwargs.pop("temperature", None)
+    elif step == "use_max_completion_tokens" and "max_tokens" in kwargs:
+        kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+    elif step == "use_max_tokens" and "max_completion_tokens" in kwargs:
+        kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+    elif step == "json_object" and kwargs.get("response_format", {}).get("type") == "json_schema":
+        kwargs["response_format"] = {"type": "json_object"}
+    elif step == "drop_response_format":
+        kwargs.pop("response_format", None)
+
+
+def _remember_relaxation(key: tuple[str, str], step: str) -> None:
+    with _learned_lock:
+        if key not in _learned_relaxations and len(_learned_relaxations) >= _MAX_LEARNED_MODELS:
+            return
+        steps = _learned_relaxations.setdefault(key, [])
+        if step not in steps:
+            steps.append(step)
 
 
 def _openai_compatible_complete(
@@ -458,34 +583,33 @@ def _openai_compatible_complete(
             else {"type": "json_object"}
         )
 
+    # Replay what this provider and model rejected before, saving a failed round trip each.
+    learned_key = (provider, model_name)
+    for step in _learned_relaxations.get(learned_key, ()):
+        _apply_relaxation(kwargs, step)
+
     response = None
     try:
-        for _ in range(5):
+        for _ in range(_MAX_REQUESTS_PER_CALL):
             try:
                 response = client.chat.completions.create(**kwargs)
                 break
             except openai.BadRequestError as exc:
-                detail = str(exc).lower()
-                if "temperature" in kwargs and "temperature" in detail:
-                    kwargs.pop("temperature")
-                elif "max_tokens" in kwargs and "max_tokens" in detail:
-                    kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
-                elif "max_completion_tokens" in kwargs and "max_completion_tokens" in detail:
-                    kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
-                elif "response_format" in kwargs and any(w in detail for w in ("response_format", "json", "schema")):
-                    if kwargs["response_format"]["type"] == "json_schema":
-                        kwargs["response_format"] = {"type": "json_object"}
-                    else:
-                        kwargs.pop("response_format")
-                else:
+                step = _relaxation_for(kwargs, str(exc).lower())
+                if step is None:
                     raise
-                logger.info("provider %s rejected a parameter; retrying with a simpler request", provider)
+                _apply_relaxation(kwargs, step)
+                _remember_relaxation(learned_key, step)
+                logger.info("provider %s rejected a parameter; retrying with %s", provider, step)
     except (openai.AuthenticationError, openai.PermissionDeniedError) as exc:
         raise LLMConfigError(f"the API key was rejected by {provider} ({type(exc).__name__})") from exc
     except openai.NotFoundError as exc:
-        raise LLMConfigError(f"model '{model_name}' not found at {provider}") from exc
+        hint = f": pull it with `ollama pull {model_name}` or set OLLAMA_MODEL" if provider == "ollama" else ""
+        raise LLMSetupError(f"model '{model_name}' not found at {provider}{hint}") from exc
     except openai.APIStatusError as exc:
         raise LLMError(f"{provider} error: HTTP {exc.status_code} ({type(exc).__name__})") from exc
+    except openai.APIConnectionError as exc:  # includes APITimeoutError
+        raise _connection_error(provider, exc, openai.APITimeoutError) from exc
     except openai.OpenAIError as exc:
         raise LLMError(f"{provider} error: {type(exc).__name__}") from exc
     if response is None:
@@ -574,7 +698,39 @@ def call_llm(
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         raise ValueError("max_tokens must be a positive integer")
     _check_llm_args(api_key, provider, model)
+    return _complete_with_retries(
+        prompt, system_message, json_mode, schema, temperature, max_tokens,
+        _coerce_json_object if json_mode else _require_text,
+        api_key=api_key, provider=provider, model=model,
+    )
 
+
+def _require_text(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise LLMOutputError(f"expected text, got {type(raw).__name__}")
+    return raw
+
+
+def _complete_with_retries(
+    prompt: str,
+    system_message: str,
+    json_mode: bool,
+    schema: dict | None,
+    temperature: float,
+    max_tokens: int,
+    parse: Callable[[Any], T],
+    *,
+    api_key: str | None,
+    provider: str | None,
+    model: str | None,
+) -> T:
+    """Call the provider and `parse` its output, re-asking on unusable output.
+
+    `parse` raises LLMOutputError for output it cannot use (bad JSON, failed schema
+    validation, ...). Every kind of unusable output shares one budget of MAX_ATTEMPTS
+    model calls. Provider and config errors are raised at once, never retried here (the
+    SDK already retries transient HTTP failures), and no other exception type escapes.
+    """
     last_error: LLMOutputError | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -582,18 +738,14 @@ def call_llm(
                 prompt, system_message, json_mode, schema, temperature, max_tokens,
                 api_key=api_key, provider=provider, model=model,
             )
-            if json_mode:
-                return _coerce_json_object(raw)
-            if not isinstance(raw, str):
-                raise LLMOutputError(f"expected text, got {type(raw).__name__}")
-            return raw
+            return parse(raw)
         except LLMOutputError as exc:
             last_error = exc
-            logger.warning("call_llm attempt %d/%d: unusable output (%s)", attempt, MAX_ATTEMPTS, exc)
+            logger.warning("LLM attempt %d/%d: unusable output (%s)", attempt, MAX_ATTEMPTS, exc)
         except LLMError:
             raise
         except Exception as exc:  # never let an unexpected type escape
-            logger.error("call_llm attempt %d: unexpected %s", attempt, type(exc).__name__)
+            logger.error("LLM attempt %d: unexpected %s", attempt, type(exc).__name__)
             raise LLMError(f"unexpected error: {type(exc).__name__}") from exc
     raise LLMOutputError(f"unusable output after {MAX_ATTEMPTS} attempts: {last_error}")
 
@@ -616,6 +768,18 @@ class _Anomaly(BaseModel):
     current_state: str
     gap_description: str
     recommended_remediation: str
+    # Optional: older or weaker models may omit it. Checked against the real keys later.
+    state_fields: list[str] = []
+
+    @field_validator("state_fields", mode="before")
+    @classmethod
+    def _string_list(cls, value: Any) -> list[str]:
+        """Lenient: a malformed state_fields never fails the finding, it just becomes []."""
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        return [v for v in value if isinstance(v, str) and v.strip()]
 
     @field_validator("category", "severity", "gap_type", mode="before")
     @classmethod
@@ -647,89 +811,57 @@ def _truncate(text: str, limit: int) -> str:
     return cut + "…"
 
 
-def _truncate_verbatim(text: str, limit: int) -> str:
-    """Shorten a quote by cutting it, never adding characters, so it stays verbatim."""
-    if len(text) <= limit:
-        return text
-    cut = text[:limit]
-    space = cut.rfind(" ")
-    if space > limit // 2:
-        cut = cut[:space]
-    return cut.rstrip(" ,;:")
+# Excerpt grounding lives in grounding.py; these aliases keep the engine's internal names.
+_truncate_verbatim = grounding.truncate_verbatim
+_normalized_with_map = grounding.normalized_with_map
+_RegulationIndex = grounding.RegulationIndex
+_SENTENCE_SPLIT_RE = grounding.SENTENCE_SPLIT_RE
+_WORD_RE = grounding.WORD_RE
 
 
-_QUOTE_MAP = str.maketrans({
-    "‘": "'", "’": "'", "“": '"', "”": '"',
-    "–": "-", "—": "-", " ": " ",
-})
+_MAX_STATE_PATH_DEPTH = 4
 
 
-def _normalized_with_map(text: str) -> tuple[str, list[int]]:
-    """Casefold, unify quotes/dashes, collapse whitespace; map each char back to the source."""
-    out: list[str] = []
-    index: list[int] = []
-    prev_space = True
-    for i, ch in enumerate(text):
-        ch = unicodedata.normalize("NFKC", ch).translate(_QUOTE_MAP).casefold()
-        for c in ch:
-            if c.isspace():
-                if prev_space:
-                    continue
-                c, prev_space = " ", True
-            else:
-                prev_space = False
-            out.append(c)
-            index.append(i)
-    return "".join(out), index
+def _state_key_paths(state: Any, prefix: str = "", depth: int = 0) -> list[str]:
+    """Every key of the company state, nested keys as dotted paths ("security.encryption")."""
+    if not isinstance(state, dict) or depth >= _MAX_STATE_PATH_DEPTH:
+        return []
+    paths: list[str] = []
+    for key, value in state.items():
+        path = f"{prefix}{key}"
+        paths.append(path)
+        paths += _state_key_paths(value, path + ".", depth + 1)
+    return paths
 
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.;!?])\s+(?=[A-Z0-9(\"'])|\n+")
-_WORD_RE = re.compile(r"[a-z0-9]{3,}")
+def _resolve_state_fields(claimed: list[str], current_state: str, known: list[str]) -> list[str]:
+    """The company-state keys a finding refers to, restricted to keys that really exist.
 
-
-def _source_slice(regulation: str, index: list[int], start: int, length: int) -> str:
-    end = index[min(start + length, len(index)) - 1] + 1
-    return regulation[index[start] : end]
-
-
-def _ground_excerpt(excerpt: str, regulation: str, norm_reg: str, index: list[int]) -> str:
-    """Return a verbatim quote from the regulation that supports the finding.
-
-    The model's excerpt is located in the regulation (ignoring case, whitespace and quote
-    style) and replaced with the exact source text. If it cannot be found, the closest
-    regulation sentence is used instead, so every excerpt is a real quote.
+    The model's `state_fields` are kept when they name a real key (matched ignoring case);
+    keys quoted in `current_state` (e.g. "data_retention_days = 30") are added, so the
+    field is filled even when the model leaves it out. Order: model's first, no repeats.
     """
-    norm_ex = _normalized_with_map(excerpt)[0].strip().strip("\"'…. ")
-    if norm_ex:
-        pos = norm_reg.find(norm_ex)
-        if pos != -1:
-            return _truncate_verbatim(_source_slice(regulation, index, pos, len(norm_ex)).strip(), MAX_EXCERPT_CHARS)
-        # The model sometimes joins two fragments with "..."; ground the longest fragment.
-        fragments = sorted((f.strip() for f in re.split(r"\.{3}|…", norm_ex)), key=len, reverse=True)
-        for frag in fragments:
-            if len(frag) >= 20:
-                pos = norm_reg.find(frag)
-                if pos != -1:
-                    return _truncate_verbatim(_source_slice(regulation, index, pos, len(frag)).strip(), MAX_EXCERPT_CHARS)
-
-    # Not quoted verbatim: use the regulation sentence that shares the most words with it.
-    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(regulation) if len(s.strip()) >= 15]
-    if not sentences:
-        return _truncate_verbatim(regulation.strip(), MAX_EXCERPT_CHARS)
-    target_words = set(_WORD_RE.findall(norm_ex))
-    best, best_score = sentences[0], (-1.0, -1.0)
-    for sentence in sentences:
-        norm_sentence = _normalized_with_map(sentence)[0]
-        words = set(_WORD_RE.findall(norm_sentence))
-        overlap = len(target_words & words) / len(target_words) if target_words else 0.0
-        score = (overlap, difflib.SequenceMatcher(None, norm_ex, norm_sentence, autojunk=False).ratio())
-        if score > best_score:
-            best, best_score = sentence, score
-    return _truncate_verbatim(best, MAX_EXCERPT_CHARS)
+    by_folded = {path.casefold(): path for path in known}
+    fields: list[str] = []
+    for name in claimed:
+        path = by_folded.get(name.strip().casefold())
+        if path and path not in fields:
+            fields.append(path)
+    for path in known:
+        if path not in fields and re.search(rf"(?<![\w.]){re.escape(path)}(?!\w|\.\w)", current_state):
+            fields.append(path)
+    return fields
 
 
-def _finalize_anomalies(items: list[_Anomaly], regulation_text: str) -> list[dict]:
-    norm_reg, index = _normalized_with_map(regulation_text)
+def _finalize_anomalies(items: list[_Anomaly], regulation_text: str, state: dict) -> list[dict]:
+    """Dedupe, truncate titles, ground excerpts, resolve state fields, sort by severity,
+    cap at 25 and assign ids.
+
+    Output keys: id, the ANOMALY_ITEM_FIELDS, then the additive state_fields,
+    excerpt_match, excerpt_score and excerpt_span (see grounding.py).
+    """
+    regulation = _RegulationIndex(regulation_text)
+    known_paths = _state_key_paths(state)
     seen: set[tuple[str, str]] = set()
     cleaned: list[dict] = []
     for item in items:
@@ -739,19 +871,38 @@ def _finalize_anomalies(items: list[_Anomaly], regulation_text: str) -> list[dic
             continue
         seen.add(key)
         record["title"] = _truncate(record["title"], MAX_TITLE_CHARS)
-        record["regulation_excerpt"] = _ground_excerpt(
-            record["regulation_excerpt"], regulation_text, norm_reg, index
-        )
+        grounded = regulation.ground(record["regulation_excerpt"])
+        record["regulation_excerpt"] = grounded.text
+        record["excerpt_match"] = grounded.match
+        record["excerpt_score"] = grounded.score
+        record["excerpt_span"] = list(grounded.span) if grounded.span else None
         if record["gap_type"] == "insufficient_information" or not record["current_state"]:
             record["current_state"] = NOT_SPECIFIED
+        # Infer keys only from a real description of the state, never from the sentinel
+        # (its words, e.g. "company", could otherwise match a key).
+        described = "" if record["current_state"] == NOT_SPECIFIED else record["current_state"]
+        record["state_fields"] = _resolve_state_fields(record["state_fields"], described, known_paths)
         cleaned.append(record)
 
     cleaned.sort(key=lambda r: SEVERITY_RANK[r["severity"]])  # stable
     cleaned = cleaned[:MAX_ANOMALIES]
     return [
-        {"id": f"ANOM-{i:03d}", **{k: r[k] for k in ANOMALY_ITEM_FIELDS}}
+        {"id": f"ANOM-{i:03d}", **{k: r[k] for k in ANOMALY_ITEM_FIELDS + ADDITIVE_FIELDS}}
         for i, r in enumerate(cleaned, start=1)
     ]
+
+
+def build_coverage(regulation_text: str, anomalies: list[dict]) -> list[dict]:
+    """Clause-by-clause coverage of the regulation by grounded findings (see grounding.py).
+
+    Each item: {"id": "CL-001", "text": str, "span": [start, end],
+    "status": "gap" | "needs_info" | "not_flagged", "finding_ids": [str, ...]}.
+    """
+    if not isinstance(regulation_text, str) or not regulation_text.strip():
+        raise ValueError("regulation_text must be a non-empty string")
+    if not isinstance(anomalies, list):
+        raise ValueError("anomalies must be a list")
+    return grounding.build_coverage(regulation_text, anomalies)
 
 
 def _validate_analysis_inputs(regulation_text: Any, state: Any) -> str:
@@ -788,30 +939,48 @@ def analyze_compliance_gap(
 
     Returns anomaly dicts sorted most-severe first, with ids ANOM-001, ANOM-002, ...
     An empty list means no gaps were found. `api_key`, `provider` and `model` let the end
-    user run on their own key and model with any supported provider (default: environment). Raises ValueError on bad input and
-    LLMError (or a subclass) when the model cannot produce a valid result.
+    user run on their own key and model with any supported provider (default: environment).
+    Raises ValueError on bad input and LLMError (or a subclass) when the model cannot
+    produce a valid result. With AI_ENGINE_DEMO=1, recorded output is replayed offline.
     """
     state_json = _validate_analysis_inputs(regulation_text, current_company_state_dict)
     _check_llm_args(api_key, provider, model)
+    if _demo_mode():
+        anomalies = _demo_analysis(regulation_text, current_company_state_dict)
+        return _finalize_anomalies(anomalies, regulation_text, current_company_state_dict)
     prompt = build_analysis_prompt(regulation_text, state_json)
+    # Bad JSON and schema-invalid JSON share one budget of MAX_ATTEMPTS model calls.
+    parsed = _complete_with_retries(
+        prompt, ANALYSIS_SYSTEM_PROMPT, True, ANALYSIS_SCHEMA, 0.0, DEFAULT_MAX_TOKENS,
+        _parse_analysis, api_key=api_key, provider=provider, model=model,
+    )
+    return _finalize_anomalies(parsed.anomalies, regulation_text, current_company_state_dict)
 
-    # call_llm already retries unusable output (and its LLMOutputError propagates), so
-    # this loop only re-asks when the JSON parses but fails schema validation.
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        payload = call_llm(
-            prompt, ANALYSIS_SYSTEM_PROMPT, json_mode=True, schema=ANALYSIS_SCHEMA,
-            api_key=api_key, provider=provider, model=model,
+
+def _demo_mode() -> bool:
+    """True when AI_ENGINE_DEMO opts in to the offline demo mode (no LLM is ever called)."""
+    _load_dotenv()
+    return os.environ.get("AI_ENGINE_DEMO", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _demo_analysis(regulation_text: str, state: dict) -> list[_Anomaly]:
+    """Recorded findings for a bundled sample input, through the real schema validation."""
+    recorded = demo_fixtures.recorded_analysis(regulation_text, state)
+    if recorded is None:
+        raise LLMError(
+            "offline demo mode (AI_ENGINE_DEMO=1) only has recorded results for the sample regulation "
+            "with the default company state; unset AI_ENGINE_DEMO and configure a model to analyze other input"
         )
-        try:
-            parsed = _AnalysisPayload.model_validate(payload)
-        except ValidationError as exc:
-            logger.warning(
-                "analyze_compliance_gap attempt %d/%d: schema validation failed (%d errors)",
-                attempt, MAX_ATTEMPTS, exc.error_count(),
-            )
-            continue
-        return _finalize_anomalies(parsed.anomalies, regulation_text)
-    raise LLMOutputError(f"analysis output failed schema validation {MAX_ATTEMPTS} times")
+    logger.warning("AI_ENGINE_DEMO is on: returning recorded sample output, no LLM was called")
+    return _parse_analysis(recorded).anomalies
+
+
+def _parse_analysis(raw: Any) -> _AnalysisPayload:
+    """Parse and schema-validate the analysis output; LLMOutputError if it is unusable."""
+    try:
+        return _AnalysisPayload.model_validate(_coerce_json_object(raw))
+    except ValidationError as exc:
+        raise LLMOutputError(f"analysis output failed schema validation ({exc.error_count()} errors)") from None
 
 
 # --------------------------------------------------------------------------- audit trail
@@ -848,7 +1017,7 @@ def _normalize_audit_items(anomalies: Any) -> list[dict]:
         for field in ("title", "gap_description"):
             if not isinstance(item.get(field), str) or not item[field].strip():
                 raise ValueError(f"anomaly #{position} has no {field}")
-        record = {k: v for k, v in item.items()}
+        record = dict(item)
         for key in OUTPUT_KEYS:
             value = record.get(key)
             record[key] = value.strip() if isinstance(value, str) else ("" if value is None else str(value))
@@ -1052,20 +1221,65 @@ def generate_audit_trail(
     produces a deterministic "no gaps" log without calling the LLM. If the model's output
     fails validation twice, a deterministic renderer is used instead. `api_key`, `provider`
     and `model` select the user's own key and model (default: environment). Raises ValueError on
-    bad input and LLMError if the provider cannot be reached.
+    bad input and LLMError if the provider cannot be reached. With AI_ENGINE_DEMO=1 the
+    deterministic renderer is used and no LLM is called. Raw HTML is never emitted: every
+    "<" is escaped, so untrusted regulation or company text cannot inject markup.
     """
+    report = generate_audit_report(anomalies, generated_at, api_key=api_key, provider=provider, model=model)
+    return report["markdown"]
+
+
+def generate_audit_report(
+    anomalies: list[dict],
+    generated_at: datetime | None = None,
+    *,
+    api_key: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> dict:
+    """generate_audit_trail plus how the log was produced.
+
+    Returns {"markdown": str, "renderer": "llm" | "deterministic", "model": str | None}.
+    `renderer` says who wrote the log: the LLM, or the deterministic renderer (no gaps,
+    demo mode, or the LLM's log failed validation). `model` is the LLM model that was
+    called for this log, or None when no LLM was called (no gaps, demo mode). Same inputs
+    and errors as generate_audit_trail.
+    """
+    markdown, renderer, model_used = _audit_markdown(
+        anomalies, generated_at, api_key=api_key, provider=provider, model=model
+    )
+    return {"markdown": _escape_html(markdown), "renderer": renderer, "model": model_used}
+
+
+def _escape_html(markdown: str) -> str:
+    """Neutralize raw HTML in the audit log; "&lt;" still renders as "<" in Markdown.
+
+    Escaping "<" is enough: without it no tag can open, and Markdown's own syntax (tables,
+    headings, "**", blockquote ">") does not need it. Applied after validation, so the
+    date and structure checks see the text as written.
+    """
+    return markdown.replace("<", "&lt;")
+
+
+def _audit_markdown(
+    anomalies: Any, generated_at: datetime | None, *, api_key: str | None, provider: str | None,
+    model: str | None,
+) -> tuple[str, str, str | None]:
+    """The audit log before HTML escaping, the renderer that wrote it, and the model called."""
     items = _normalize_audit_items(anomalies)
     _check_llm_args(api_key, provider, model)
     when = _resolve_generated_at(generated_at)
     iso = when.strftime("%Y-%m-%dT%H:%M:%SZ")
     report_id = "AUD-" + when.strftime("%Y%m%dT%H%M%SZ")
-    try:
-        model_label = _resolve_model(_resolve_provider(provider, api_key), model)
-    except LLMConfigError:
-        model_label = model or _model_name()
+    if _demo_mode():  # offline: the deterministic renderer, labelled as such
+        model_label = demo_fixtures.DEMO_MODEL_LABEL
+        if not items:
+            return _render_no_gaps(iso, report_id, model_label), "deterministic", None
+        return _render_audit_fallback(items, iso, report_id, model_label), "deterministic", None
+    model_label = _model_label(api_key, provider, model)
 
     if not items:
-        return _render_no_gaps(iso, report_id, model_label)
+        return _render_no_gaps(iso, report_id, model_label), "deterministic", None
 
     payload = [{k: r[k] for k in OUTPUT_KEYS} for r in items]
     prompt = build_audit_prompt(
@@ -1081,29 +1295,17 @@ def generate_audit_trail(
             break  # call_llm already retried; go straight to the fallback
         markdown = _strip_markdown_fences(str(text))
         if _audit_is_valid(markdown, iso, items):
-            return markdown
+            return markdown, "llm", model_label
         logger.warning("generate_audit_trail attempt %d/%d: output failed validation", attempt, AUDIT_ATTEMPTS)
 
     logger.warning("generate_audit_trail: using deterministic fallback renderer")
-    return _render_audit_fallback(items, iso, report_id, model_label)
+    return _render_audit_fallback(items, iso, report_id, model_label), "deterministic", model_label
 
 
 # --------------------------------------------------------------------------- smoke test
 
-_DEMO_REGULATION = """Data Protection and Retention Regulation 2026, Section 4.
-
-4.1 Every regulated entity must retain customer transaction records for a minimum of 90 days.
-4.2 Personal data must be encrypted at rest using industry-standard encryption.
-4.3 In the event of a personal data breach, the entity must notify the regulator within 72 hours of becoming aware of it.
-4.4 Every regulated entity must appoint a Data Protection Officer (DPO).
-4.5 Access to customer data must be reviewed at least once every quarter."""
-
-_DEMO_STATE = {
-    "data_retention_days": 30,
-    "encryption_at_rest": True,
-    "breach_notification_hours": 96,
-    "dpo_appointed": False,
-}
+_DEMO_REGULATION = demo_fixtures.SMOKE_REGULATION
+_DEMO_STATE = demo_fixtures.SMOKE_STATE
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
