@@ -1,0 +1,110 @@
+[
+  {
+    "id": "ANOM-001",
+    "title": "NTP Source Not Traceable to NPL or NIC",
+    "category": "security",
+    "severity": "high",
+    "gap_type": "non_compliant",
+    "regulation_requirement": "Connect to NTP Server of NIC or NPL or traceable NTP servers.",
+    "regulation_excerpt": "shall connect to the Network Time Protocol (NTP) Server of National Informatics Centre (NIC) or National Physical Laboratory (NPL) or with NTP servers traceable to these NTP servers",
+    "current_state": "ntp_source_corporate_endpoints = time.windows.com, ntp_source_production = Amazon Time Sync Service (169.254.169.123)",
+    "gap_description": "The company's NTP sources are not traceable to NIC or NPL.",
+    "recommended_remediation": "Switch to NTP servers traceable to NIC or NPL and update the configuration."
+  },
+  {
+    "id": "ANOM-002",
+    "title": "Log Retention Period Too Short",
+    "category": "data_retention",
+    "severity": "high",
+    "gap_type": "non_compliant",
+    "regulation_requirement": "Maintain logs for 180 days.",
+    "regulation_excerpt": "(iv) All service providers, intermediaries, data centres, body corporate and Government organisations shall mandatorily enable logs of all their ICT systems and maintain them securely for a rolling",
+    "current_state": "ict_log_retention_days = 90",
+    "gap_description": "The log retention period is 90 days, which is less than the required 180 days.",
+    "recommended_remediation": "Increase the log retention period to 180 days and ensure compliance."
+  },
+  {
+    "id": "ANOM-003",
+    "title": "Log Storage Outside Indian Jurisdiction",
+    "category": "data_retention",
+    "severity": "high",
+    "gap_type": "non_compliant",
+    "regulation_requirement": "Maintain logs within Indian jurisdiction.",
+    "regulation_excerpt": "the same shall be maintained within the Indian jurisdiction",
+    "current_state": "ict_log_storage = Splunk Cloud, us-east-1 (N. Virginia)",
+    "gap_description": "Logs are stored in the US, outside the Indian jurisdiction.",
+    "recommended_remediation": "Move log storage to an Indian jurisdiction and ensure compliance."
+  },
+  {
+    "id": "ANOM-004",
+    "title": "Cyber Incident Reporting SLA Exceeds Requirement",
+    "category": "reporting",
+    "severity": "medium",
+    "gap_type": "non_compliant",
+    "regulation_requirement": "Report cyber incidents within 6 hours.",
+    "regulation_excerpt": "shall mandatorily report cyber incidents as mentioned in Annexure I to CERT-In within 6 hours of noticing such incidents",
+    "current_state": "cert_in_reporting_sla_hours = 24, cert_in_reporting_trigger = after SEV1/SEV2 triage is complete",
+    "gap_description": "The company's reporting SLA is 24 hours, exceeding the required 6 hours.",
+    "recommended_remediation": "Reduce the reporting SLA to 6 hours and ensure compliance with the trigger condition."
+  },
+  {
+    "id": "ANOM-005",
+    "title": "Insufficient Information on POC Details Submission",
+    "category": "governance",
+    "severity": "medium",
+    "gap_type": "insufficient_information",
+    "regulation_requirement": "Submit Point of Contact details to CERT-In.",
+    "regulation_excerpt": "The Information relating to a Point of Contact shall be sent to CERT-In in the format specified at Annexure II",
+    "current_state": "Not specified in company state",
+    "gap_description": "The company has not submitted Point of Contact details to CERT-In.",
+    "recommended_remediation": "Submit the Point of Contact details to CERT-In as per the specified format."
+  },
+  {
+    "id": "ANOM-006",
+    "title": "Insufficient Logging for Network Firewalls",
+    "category": "security",
+    "severity": "medium",
+    "gap_type": "non_compliant",
+    "regulation_requirement": "Enable logs for all ICT systems.",
+    "regulation_excerpt": "All service providers, intermediaries, data centres, body corporate and Government organisations shall mandatorily enable logs of all their ICT systems",
+    "current_state": "ict_logging_not_enabled_for = [\"network firewalls\"]",
+    "gap_description": "Network firewalls are not logged.",
+    "recommended_remediation": "Enable logging for network firewalls and ensure they are included in the log retention policy."
+  },
+  {
+    "id": "ANOM-007",
+    "title": "Insufficient Logging for VPN Concentrator",
+    "category": "security",
+    "severity": "medium",
+    "gap_type": "non_compliant",
+    "regulation_requirement": "Enable logs for all ICT systems.",
+    "regulation_excerpt": "All service providers, intermediaries, data centres, body corporate and Government organisations shall mandatorily enable logs of all their ICT systems",
+    "current_state": "ict_logging_not_enabled_for = [\"VPN concentrator\"]",
+    "gap_description": "VPN concentrator is not logged.",
+    "recommended_remediation": "Enable logging for VPN concentrator and ensure it is included in the log retention policy."
+  },
+  {
+    "id": "ANOM-008",
+    "title": "Insufficient Logging for Corporate Laptops",
+    "category": "security",
+    "severity": "medium",
+    "gap_type": "non_compliant",
+    "regulation_requirement": "Enable logs for all ICT systems.",
+    "regulation_excerpt": "All service providers, intermediaries, data centres, body corporate and Government organisations shall mandatorily enable logs of all their ICT systems",
+    "current_state": "ict_logging_not_enabled_for = [\"corporate laptops\"]",
+    "gap_description": "Corporate laptops are not logged.",
+    "recommended_remediation": "Enable logging for corporate laptops and ensure they are included in the log retention policy."
+  },
+  {
+    "id": "ANOM-009",
+    "title": "Insufficient Information on NTP Drift Monitoring",
+    "category": "security",
+    "severity": "medium",
+    "gap_type": "insufficient_information",
+    "regulation_requirement": "Monitor NTP drift against NPL or NIC.",
+    "regulation_excerpt": "shall connect to the Network Time Protocol (NTP) Server of National Informatics Centre (NIC) or National Physical Laboratory (NPL) or with NTP servers traceable to these NTP servers",
+    "current_state": "Not specified in company state",
+    "gap_description": "There is no information on NTP drift monitoring against NPL or NIC.",
+    "recommended_remediation": "Implement NTP drift monitoring against NPL or NIC and document the process."
+  }
+]

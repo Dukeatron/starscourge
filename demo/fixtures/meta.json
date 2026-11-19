@@ -1,0 +1,15 @@
+{
+  "captured_at_utc": "2026-11-19T08:34:30Z",
+  "provider": "ollama",
+  "model": "qwen2.5-coder:14b",
+  "analysis_source": "live /api/analyze-regulation",
+  "audit_source": "ai_engine._render_audit_fallback (deterministic, no LLM)",
+  "findings": 9,
+  "severities": {
+    "critical": 0,
+    "high": 3,
+    "medium": 6,
+    "low": 0
+  },
+  "needs_info": 2
+}
