@@ -1034,6 +1034,32 @@ def test_dotenv_is_loaded_lazily_without_overriding(no_key, monkeypatch, tmp_pat
     assert os.environ["OPENAI_API_KEY"] == "from-env"
 
 
+# --------------------------------------------------------------------------- offline demo mode
+
+
+def test_demo_mode_smoke_pair_end_to_end_without_any_provider(no_key, monkeypatch):
+    monkeypatch.setenv("AI_ENGINE_DEMO", "1")
+    monkeypatch.setattr(ai_engine, "_provider_complete", FakeProvider(AssertionError("no LLM in demo mode")))
+    found = analyze_compliance_gap(REGULATION, STATE)
+    assert [a["severity"] for a in found] == ["critical", "high", "high", "medium"]
+    assert all(set(a) == EXPECTED_KEYS and a["regulation_excerpt"] in REGULATION for a in found)
+    md = generate_audit_trail(found, generated_at=GENERATED_AT)
+    assert _audit_is_valid(md, ISO, ai_engine._normalize_audit_items(found))
+    assert "offline-demo" in md
+    assert "offline-demo" in generate_audit_trail([], generated_at=GENERATED_AT)
+
+
+def test_demo_mode_is_off_by_default_and_unknown_input_is_llm_error(provider, monkeypatch):
+    fake = provider('{"anomalies": []}')
+    assert analyze_compliance_gap(REGULATION, STATE) == [] and len(fake.calls) == 1
+    monkeypatch.setenv("AI_ENGINE_DEMO", "true")
+    with pytest.raises(LLMError, match="AI_ENGINE_DEMO"):
+        analyze_compliance_gap(REGULATION, {"other": 1})
+    with pytest.raises(ValueError):  # input validation still runs first
+        analyze_compliance_gap("", STATE)
+    assert len(fake.calls) == 1
+
+
 # --------------------------------------------------------------------------- grounding
 
 

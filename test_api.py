@@ -223,6 +223,58 @@ def test_api_key_is_not_echoed_in_errors(fake_provider):
     assert "sk-ant-secret" not in response.text
 
 
+# --------------------------------------------------------------------------- offline demo mode
+
+
+def test_demo_mode_runs_the_ui_sample_offline(fake_provider, monkeypatch):
+    import demo_fixtures
+
+    calls = fake_provider(AssertionError("demo mode must not call a provider"))
+    monkeypatch.setenv("AI_ENGINE_DEMO", "1")
+    response = client.post(
+        "/api/analyze-regulation",
+        json={"text": "  " + demo_fixtures.UI_SAMPLE_REGULATION.replace("\n", "\r\n"), "company_state": get_compliance_state()},
+    )
+    assert response.status_code == 200
+    anomalies = response.json()
+    assert [a["id"] for a in anomalies] == ["ANOM-001", "ANOM-002", "ANOM-003", "ANOM-004"]
+    assert all(set(a) == set(finding()) | {"id"} for a in anomalies)
+    assert all(a["regulation_excerpt"] in demo_fixtures.UI_SAMPLE_REGULATION for a in anomalies)
+
+    audit = client.post("/api/generate-audit", json={"anomalies": anomalies})
+    assert audit.status_code == 200
+    markdown = audit.json()["markdown"]
+    assert demo_fixtures.DEMO_MODEL_LABEL in markdown and "### ANOM-004" in markdown
+    assert calls == []
+
+
+def test_demo_mode_refuses_input_it_has_no_recording_for(fake_provider, monkeypatch):
+    calls = fake_provider(AssertionError("demo mode must not call a provider"))
+    monkeypatch.setenv("AI_ENGINE_DEMO", "1")
+    edited_state = {**get_compliance_state(), "data_retention_days": 365}
+    for body in ({"text": REGULATION}, {"text": "Some other regulation text.", "company_state": edited_state}):
+        response = client.post("/api/analyze-regulation", json=body)
+        assert response.status_code == 502
+        assert "AI_ENGINE_DEMO" in response.json()["detail"]["message"]
+    assert calls == []
+
+
+def test_demo_fixture_matches_the_ui_sample_regulation():
+    """If the UI's sample text changes, demo_fixtures.UI_SAMPLE_REGULATION must follow it."""
+    import re
+    from pathlib import Path
+
+    import demo_fixtures
+
+    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+    match = re.search(r"const SAMPLE = `(.*?)`;", html, re.DOTALL)
+    if match is None:
+        pytest.skip("the UI no longer defines a SAMPLE regulation")
+    assert " ".join(match.group(1).split()) == " ".join(demo_fixtures.UI_SAMPLE_REGULATION.split()), (
+        "static/index.html SAMPLE changed: update demo_fixtures.UI_SAMPLE_REGULATION and its findings"
+    )
+
+
 def test_cors_allows_the_key_header():
     response = client.options(
         "/api/analyze-regulation",

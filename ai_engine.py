@@ -45,6 +45,7 @@ from typing import Any, Callable, Literal, NamedTuple, TypeVar
 import anthropic
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
+import demo_fixtures
 from prompts import (
     ANALYSIS_SCHEMA,
     ANALYSIS_SYSTEM_PROMPT,
@@ -978,11 +979,14 @@ def analyze_compliance_gap(
 
     Returns anomaly dicts sorted most-severe first, with ids ANOM-001, ANOM-002, ...
     An empty list means no gaps were found. `api_key`, `provider` and `model` let the end
-    user run on their own key and model with any supported provider (default: environment). Raises ValueError on bad input and
-    LLMError (or a subclass) when the model cannot produce a valid result.
+    user run on their own key and model with any supported provider (default: environment).
+    Raises ValueError on bad input and LLMError (or a subclass) when the model cannot
+    produce a valid result. With AI_ENGINE_DEMO=1, recorded output is replayed offline.
     """
     state_json = _validate_analysis_inputs(regulation_text, current_company_state_dict)
     _check_llm_args(api_key, provider, model)
+    if _demo_mode():
+        return _finalize_anomalies(_demo_analysis(regulation_text, current_company_state_dict), regulation_text)
     prompt = build_analysis_prompt(regulation_text, state_json)
     # Bad JSON and schema-invalid JSON share one budget of MAX_ATTEMPTS model calls.
     parsed = _complete_with_retries(
@@ -990,6 +994,24 @@ def analyze_compliance_gap(
         _parse_analysis, api_key=api_key, provider=provider, model=model,
     )
     return _finalize_anomalies(parsed.anomalies, regulation_text)
+
+
+def _demo_mode() -> bool:
+    """True when AI_ENGINE_DEMO opts in to the offline demo mode (no LLM is ever called)."""
+    _load_dotenv()
+    return os.environ.get("AI_ENGINE_DEMO", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _demo_analysis(regulation_text: str, state: dict) -> list[_Anomaly]:
+    """Recorded findings for a bundled sample input, through the real schema validation."""
+    recorded = demo_fixtures.recorded_analysis(regulation_text, state)
+    if recorded is None:
+        raise LLMError(
+            "offline demo mode (AI_ENGINE_DEMO=1) only has recorded results for the sample regulation "
+            "with the default company state; unset AI_ENGINE_DEMO and configure a model to analyze other input"
+        )
+    logger.warning("AI_ENGINE_DEMO is on: returning recorded sample output, no LLM was called")
+    return _parse_analysis(recorded).anomalies
 
 
 def _parse_analysis(raw: Any) -> _AnalysisPayload:
@@ -1238,13 +1260,19 @@ def generate_audit_trail(
     produces a deterministic "no gaps" log without calling the LLM. If the model's output
     fails validation twice, a deterministic renderer is used instead. `api_key`, `provider`
     and `model` select the user's own key and model (default: environment). Raises ValueError on
-    bad input and LLMError if the provider cannot be reached.
+    bad input and LLMError if the provider cannot be reached. With AI_ENGINE_DEMO=1 the
+    deterministic renderer is used and no LLM is called.
     """
     items = _normalize_audit_items(anomalies)
     _check_llm_args(api_key, provider, model)
     when = _resolve_generated_at(generated_at)
     iso = when.strftime("%Y-%m-%dT%H:%M:%SZ")
     report_id = "AUD-" + when.strftime("%Y%m%dT%H%M%SZ")
+    if _demo_mode():  # offline: the deterministic renderer, labelled as such
+        model_label = demo_fixtures.DEMO_MODEL_LABEL
+        if not items:
+            return _render_no_gaps(iso, report_id, model_label)
+        return _render_audit_fallback(items, iso, report_id, model_label)
     model_label = _model_label(api_key, provider, model)
 
     if not items:
@@ -1273,20 +1301,8 @@ def generate_audit_trail(
 
 # --------------------------------------------------------------------------- smoke test
 
-_DEMO_REGULATION = """Data Protection and Retention Regulation 2026, Section 4.
-
-4.1 Every regulated entity must retain customer transaction records for a minimum of 90 days.
-4.2 Personal data must be encrypted at rest using industry-standard encryption.
-4.3 In the event of a personal data breach, the entity must notify the regulator within 72 hours of becoming aware of it.
-4.4 Every regulated entity must appoint a Data Protection Officer (DPO).
-4.5 Access to customer data must be reviewed at least once every quarter."""
-
-_DEMO_STATE = {
-    "data_retention_days": 30,
-    "encryption_at_rest": True,
-    "breach_notification_hours": 96,
-    "dpo_appointed": False,
-}
+_DEMO_REGULATION = demo_fixtures.SMOKE_REGULATION
+_DEMO_STATE = demo_fixtures.SMOKE_STATE
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")

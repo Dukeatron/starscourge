@@ -170,8 +170,9 @@ pytest -m live                        # real API: retention gap, compliant state
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, … | none | One per provider. Put them in a gitignored `.env` (see `.env.example`). Read at call time and never logged. |
 | `LLM_MODEL` / `<PROVIDER>_MODEL` | `claude-sonnet-5-5`, `gpt-5-mini`, `gemini-2.5-flash`, … | Override the default model. |
 | `LLM_BASE_URL`, `LLM_API_KEY` | none | For `LLM_PROVIDER=custom` (any OpenAI-compatible server). |
-| `LLM_TIMEOUT_SECONDS` | `60` | Per-read timeout. Requests are streamed. |
+| `LLM_TIMEOUT_SECONDS` | `60` | Per-read timeout (Claude requests are streamed). Connecting gives up after 5 s, and local Ollama is not retried, so a stopped server fails at once with a clear message. |
 | `LLM_EFFORT` | `medium` | `low` to `max`. |
+| `AI_ENGINE_DEMO` | off | `1` turns on **offline demo mode**. No LLM is called. The UI's sample regulation (with the default company profile) and the `python ai_engine.py` smoke test replay recorded findings through the real validation and grounding, and the audit log uses the deterministic renderer, labelled `offline-demo` in its header. Any other input returns a 502 that explains why. |
 
 ### API
 
