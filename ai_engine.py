@@ -62,6 +62,7 @@ __all__ = [
     "LLMOutputError",
     "call_llm",
     "analyze_compliance_gap",
+    "analyze_compliance_report",
     "generate_audit_trail",
     "generate_audit_report",
     "build_coverage",
@@ -943,18 +944,39 @@ def analyze_compliance_gap(
     Raises ValueError on bad input and LLMError (or a subclass) when the model cannot
     produce a valid result. With AI_ENGINE_DEMO=1, recorded output is replayed offline.
     """
+    report = analyze_compliance_report(
+        regulation_text, current_company_state_dict, api_key=api_key, provider=provider, model=model
+    )
+    return report["anomalies"]
+
+
+def analyze_compliance_report(
+    regulation_text: str,
+    current_company_state_dict: dict,
+    *,
+    api_key: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> dict:
+    """analyze_compliance_gap plus the model that produced the findings.
+
+    Returns {"anomalies": [...], "model": str | None}; `model` is the LLM model that was
+    called (resolved the same way as for the audit log), or None in demo mode, where no
+    LLM is called. Same inputs and errors as analyze_compliance_gap.
+    """
     state_json = _validate_analysis_inputs(regulation_text, current_company_state_dict)
     _check_llm_args(api_key, provider, model)
     if _demo_mode():
-        anomalies = _demo_analysis(regulation_text, current_company_state_dict)
-        return _finalize_anomalies(anomalies, regulation_text, current_company_state_dict)
+        recorded = _demo_analysis(regulation_text, current_company_state_dict)
+        return {"anomalies": _finalize_anomalies(recorded, regulation_text, current_company_state_dict), "model": None}
     prompt = build_analysis_prompt(regulation_text, state_json)
     # Bad JSON and schema-invalid JSON share one budget of MAX_ATTEMPTS model calls.
     parsed = _complete_with_retries(
         prompt, ANALYSIS_SYSTEM_PROMPT, True, ANALYSIS_SCHEMA, 0.0, DEFAULT_MAX_TOKENS,
         _parse_analysis, api_key=api_key, provider=provider, model=model,
     )
-    return _finalize_anomalies(parsed.anomalies, regulation_text, current_company_state_dict)
+    anomalies = _finalize_anomalies(parsed.anomalies, regulation_text, current_company_state_dict)
+    return {"anomalies": anomalies, "model": _model_label(api_key, provider, model)}
 
 
 def _demo_mode() -> bool:
