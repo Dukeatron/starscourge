@@ -579,6 +579,7 @@ function currentState(){
   return s;
 }
 function fmtVal(v){
+  if (v === null || v === undefined || v === '') return '<span class="meta-txt" style="font-weight:500">not set</span>';
   if (Array.isArray(v)) return v.map(x => `<span class="tag">${esc(typeof x === 'object' ? JSON.stringify(x) : x)}</span>`).join('') || '<span class="meta-txt">none</span>';
   if (v && typeof v === 'object') return `<span class="mono" style="font-size:12px">${esc(JSON.stringify(v))}</span>`;
   if (typeof v === 'boolean') return v ? 'Yes' : 'No';
