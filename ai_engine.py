@@ -664,14 +664,20 @@ _QUOTE_MAP = str.maketrans({
 })
 
 
+def _normalize_char(ch: str) -> str:
+    """Casefold one character and unify quotes and dashes (ASCII skips the Unicode tables)."""
+    if ch.isascii():
+        return ch.lower()  # NFKC and _QUOTE_MAP leave ASCII unchanged, and casefold == lower
+    return unicodedata.normalize("NFKC", ch).translate(_QUOTE_MAP).casefold()
+
+
 def _normalized_with_map(text: str) -> tuple[str, list[int]]:
     """Casefold, unify quotes/dashes, collapse whitespace; map each char back to the source."""
     out: list[str] = []
     index: list[int] = []
     prev_space = True
     for i, ch in enumerate(text):
-        ch = unicodedata.normalize("NFKC", ch).translate(_QUOTE_MAP).casefold()
-        for c in ch:
+        for c in _normalize_char(ch):
             if c.isspace():
                 if prev_space:
                     continue
@@ -685,51 +691,91 @@ def _normalized_with_map(text: str) -> tuple[str, list[int]]:
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.;!?])\s+(?=[A-Z0-9(\"'])|\n+")
 _WORD_RE = re.compile(r"[a-z0-9]{3,}")
+_ELLIPSIS_RE = re.compile(r"\.{3}|…")
+_MIN_FRAGMENT_CHARS = 20
+_MIN_SENTENCE_CHARS = 15
 
 
-def _source_slice(regulation: str, index: list[int], start: int, length: int) -> str:
-    end = index[min(start + length, len(index)) - 1] + 1
-    return regulation[index[start] : end]
+class _RegulationIndex:
+    """A regulation prepared once, so many excerpts can be grounded against it cheaply.
 
-
-def _ground_excerpt(excerpt: str, regulation: str, norm_reg: str, index: list[int]) -> str:
-    """Return a verbatim quote from the regulation that supports the finding.
-
-    The model's excerpt is located in the regulation (ignoring case, whitespace and quote
-    style) and replaced with the exact source text. If it cannot be found, the closest
-    regulation sentence is used instead, so every excerpt is a real quote.
+    The normalized text and its map back to source offsets are built up front. The
+    sentence list for the closest-sentence fallback is built only when an excerpt first
+    needs it, and is then shared by every later excerpt.
     """
-    norm_ex = _normalized_with_map(excerpt)[0].strip().strip("\"'…. ")
-    if norm_ex:
-        pos = norm_reg.find(norm_ex)
-        if pos != -1:
-            return _truncate_verbatim(_source_slice(regulation, index, pos, len(norm_ex)).strip(), MAX_EXCERPT_CHARS)
-        # The model sometimes joins two fragments with "..."; ground the longest fragment.
-        fragments = sorted((f.strip() for f in re.split(r"\.{3}|…", norm_ex)), key=len, reverse=True)
-        for frag in fragments:
-            if len(frag) >= 20:
-                pos = norm_reg.find(frag)
-                if pos != -1:
-                    return _truncate_verbatim(_source_slice(regulation, index, pos, len(frag)).strip(), MAX_EXCERPT_CHARS)
 
-    # Not quoted verbatim: use the regulation sentence that shares the most words with it.
-    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(regulation) if len(s.strip()) >= 15]
-    if not sentences:
-        return _truncate_verbatim(regulation.strip(), MAX_EXCERPT_CHARS)
-    target_words = set(_WORD_RE.findall(norm_ex))
-    best, best_score = sentences[0], (-1.0, -1.0)
-    for sentence in sentences:
-        norm_sentence = _normalized_with_map(sentence)[0]
-        words = set(_WORD_RE.findall(norm_sentence))
-        overlap = len(target_words & words) / len(target_words) if target_words else 0.0
-        score = (overlap, difflib.SequenceMatcher(None, norm_ex, norm_sentence, autojunk=False).ratio())
-        if score > best_score:
-            best, best_score = sentence, score
-    return _truncate_verbatim(best, MAX_EXCERPT_CHARS)
+    def __init__(self, regulation: str) -> None:
+        self.text = regulation
+        self.norm, self.index = _normalized_with_map(regulation)
+        self._sentences: list[tuple[str, str, frozenset[str]]] | None = None
+
+    def find(self, norm_fragment: str) -> str | None:
+        """The exact source text of a normalized fragment, or None if the regulation lacks it."""
+        pos = self.norm.find(norm_fragment)
+        if pos == -1:
+            return None
+        end = self.index[min(pos + len(norm_fragment), len(self.index)) - 1] + 1
+        return self.text[self.index[pos] : end].strip()
+
+    def sentences(self) -> list[tuple[str, str, frozenset[str]]]:
+        """(source sentence, normalized sentence, word set) for each sentence of 15+ chars."""
+        if self._sentences is None:
+            self._sentences = []
+            for raw in _SENTENCE_SPLIT_RE.split(self.text):
+                sentence = raw.strip()
+                if len(sentence) >= _MIN_SENTENCE_CHARS:
+                    norm = _normalized_with_map(sentence)[0]
+                    self._sentences.append((sentence, norm, frozenset(_WORD_RE.findall(norm))))
+        return self._sentences
+
+    def closest_sentence(self, norm_excerpt: str) -> str:
+        """The sentence sharing the most words with the excerpt; difflib similarity breaks ties.
+
+        Same result as ranking every sentence by (word overlap, difflib ratio) and taking the
+        first best, but the quadratic difflib ratio is only computed for the sentences tied
+        on the best overlap.
+        """
+        sentences = self.sentences()
+        if not sentences:
+            return self.text.strip()
+        target = set(_WORD_RE.findall(norm_excerpt))
+        overlaps = [len(target & words) / len(target) if target else 0.0 for _, _, words in sentences]
+        top = max(overlaps)
+        best, best_ratio = "", -1.0
+        for (sentence, norm, _), overlap in zip(sentences, overlaps):
+            if overlap != top:
+                continue
+            ratio = difflib.SequenceMatcher(None, norm_excerpt, norm, autojunk=False).ratio()
+            if ratio > best_ratio:
+                best, best_ratio = sentence, ratio
+        return best
+
+    def ground(self, excerpt: str) -> str:
+        """Return a verbatim quote from the regulation that supports the finding.
+
+        The model's excerpt is located in the regulation (ignoring case, whitespace and
+        quote style) and replaced with the exact source text. If it cannot be found, the
+        closest regulation sentence is used instead, so every excerpt is a real quote.
+        """
+        norm_ex = _normalized_with_map(excerpt)[0].strip().strip("\"'…. ")
+        if norm_ex:
+            exact = self.find(norm_ex)
+            if exact is not None:
+                return _truncate_verbatim(exact, MAX_EXCERPT_CHARS)
+            # The model sometimes joins two fragments with "..."; ground the longest fragment.
+            fragments = sorted((f.strip() for f in _ELLIPSIS_RE.split(norm_ex)), key=len, reverse=True)
+            for fragment in fragments:
+                if len(fragment) >= _MIN_FRAGMENT_CHARS:
+                    exact = self.find(fragment)
+                    if exact is not None:
+                        return _truncate_verbatim(exact, MAX_EXCERPT_CHARS)
+        # Not quoted verbatim: use the regulation sentence that shares the most words with it.
+        return _truncate_verbatim(self.closest_sentence(norm_ex), MAX_EXCERPT_CHARS)
 
 
 def _finalize_anomalies(items: list[_Anomaly], regulation_text: str) -> list[dict]:
-    norm_reg, index = _normalized_with_map(regulation_text)
+    """Dedupe, truncate titles, ground excerpts, sort by severity, cap at 25 and assign ids."""
+    regulation = _RegulationIndex(regulation_text)
     seen: set[tuple[str, str]] = set()
     cleaned: list[dict] = []
     for item in items:
@@ -739,9 +785,7 @@ def _finalize_anomalies(items: list[_Anomaly], regulation_text: str) -> list[dic
             continue
         seen.add(key)
         record["title"] = _truncate(record["title"], MAX_TITLE_CHARS)
-        record["regulation_excerpt"] = _ground_excerpt(
-            record["regulation_excerpt"], regulation_text, norm_reg, index
-        )
+        record["regulation_excerpt"] = regulation.ground(record["regulation_excerpt"])
         if record["gap_type"] == "insufficient_information" or not record["current_state"]:
             record["current_state"] = NOT_SPECIFIED
         cleaned.append(record)

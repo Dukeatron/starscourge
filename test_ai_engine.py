@@ -900,6 +900,52 @@ def test_dotenv_is_loaded_lazily_without_overriding(no_key, monkeypatch, tmp_pat
     assert os.environ["OPENAI_API_KEY"] == "from-env"
 
 
+# --------------------------------------------------------------------------- grounding
+
+
+def _reference_closest_sentence(excerpt: str, regulation: str) -> str:
+    """The original brute-force fallback: rank every sentence by (word overlap, difflib ratio)."""
+    import difflib
+
+    norm_ex = ai_engine._normalized_with_map(excerpt)[0].strip().strip("\"'…. ")
+    sentences = [s.strip() for s in ai_engine._SENTENCE_SPLIT_RE.split(regulation) if len(s.strip()) >= 15]
+    target = set(ai_engine._WORD_RE.findall(norm_ex))
+    best, best_score = sentences[0], (-1.0, -1.0)
+    for sentence in sentences:
+        norm = ai_engine._normalized_with_map(sentence)[0]
+        words = set(ai_engine._WORD_RE.findall(norm))
+        overlap = len(target & words) / len(target) if target else 0.0
+        score = (overlap, difflib.SequenceMatcher(None, norm_ex, norm, autojunk=False).ratio())
+        if score > best_score:
+            best, best_score = sentence, score
+    return ai_engine._truncate_verbatim(best, ai_engine.MAX_EXCERPT_CHARS)
+
+
+def test_closest_sentence_fallback_matches_brute_force_reference():
+    import random
+
+    rng = random.Random(3)
+    vocab = "entity must retain records breach notify regulator hours encryption access review officer".split()
+    regulation = "\n".join(
+        f"{i}. " + " ".join(rng.choice(vocab) for _ in range(rng.randint(4, 12))).capitalize() + "."
+        for i in range(60)
+    )
+    index = ai_engine._RegulationIndex(regulation)
+    for _ in range(40):
+        # "zzz" never occurs in the regulation, so this always takes the closest-sentence fallback.
+        paraphrase = " ".join(rng.choice(vocab + ["qqq"]) for _ in range(rng.randint(0, 8))) + " zzz"
+        assert index.ground(paraphrase) == _reference_closest_sentence(paraphrase, regulation)
+
+
+def test_normalization_handles_unicode_quotes_dashes_and_spaces():
+    text = "The Entity’s “DPO” — appointed within  72 HOURS. Ärzte"
+    norm, index = ai_engine._normalized_with_map(text)
+    assert norm == "the entity's \"dpo\" - appointed within 72 hours. ärzte"
+    assert len(norm) == len(index) and all(text[i] for i in index)
+    grounded = ai_engine._RegulationIndex(text).ground('the entity\'s "dpo" - appointed within 72 hours')
+    assert grounded == "The Entity’s “DPO” — appointed within  72 HOURS"
+
+
 # --------------------------------------------------------------------------- live tests
 
 live = pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set")
