@@ -24,7 +24,7 @@
 // re-shoot UI-only changes. The published demo should be a live take.
 //
 // SELECTORS: everything the script touches is in SEL below, aimed at the redesigned
-// static/index.html (refine/frontend @ f39d2e1, merged). If the UI changes again, update SEL.
+// static/index.html (refine/frontend @ 872f922, merged). If the UI changes again, update SEL.
 
 import { chromium } from 'playwright';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
@@ -156,7 +156,9 @@ async function installRoutes(context) {
   // from the fixture's excerpt_span values, exactly as in a live take.
   await context.route('**/api/analyze-regulation', async route => {
     await wait(delay);
-    await route.fulfill({ status: 200, contentType: 'application/json', body: analysis });
+    // Same header the real server sends, naming the model the fixture was captured with.
+    const headers = meta.model && meta.model !== 'server default' ? { 'X-LLM-Model-Used': meta.model } : {};
+    await route.fulfill({ status: 200, contentType: 'application/json', headers, body: analysis });
   });
   await context.route('**/api/generate-audit', async route => {
     await wait(delay);

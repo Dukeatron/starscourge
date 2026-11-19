@@ -38,7 +38,14 @@ Flags: `--mock`, `--fast`, `--headless`, `--no-video`, `--no-cursor`, `--no-cold
 
 ### When the UI changes
 
-All selectors live in the `SEL` object at the top of `record.mjs`. They target the redesigned `static/index.html` (refine/frontend @ a12aca6): `#healthTxt`, `#stateDetails > summary`, `#stateJson`, `#reg`, `#analyze`, `#findings .summary`, `#findings .ground-meter`, `#cards article.card` (with `.quote q`, `.grounded`, `[data-src]`), `#srcText mark`, `#audit`, `#report .md h1/h2` and `#report .doc-bar`. If an ID changes, update `SEL` and run `npm run smoke`. A failed run saves `failure.png` next to the video.
+All selectors live in the `SEL` object at the top of `record.mjs`. They target the final `static/index.html` (refine/frontend @ 872f922, merged into this branch):
+- **App and inputs:** `#healthTxt`, `#stateDetails > summary`, `#stateJson`, `#reg`, `#analyze`
+- **Findings:** `#findings .summary`, `#findings .ground-meter`, `#findings .cov-strip`, and `#cards article.card` (with `.quote q`, the server-driven `.grounded` badge, and `[data-src]`)
+- **Clause coverage:** `.tab[data-tab="coverage"]`, `#coverage .clause-map`, `#coverage .clause.nf`
+- **Source grounding:** `#srcText`
+- **Audit log:** `#audit`, `#report .doc-head` (provenance and draft marker), `#report .md h1/h2`, `#report .doc-bar`
+
+In `--mock` mode the analysis response carries `X-LLM-Model-Used` (from `fixtures/meta.json`), and the audit response carries `renderer` and `model`, as the real server does. `/api/coverage` isn't mocked. If an ID changes, update `SEL` and run `npm run smoke`. A failed run saves `failure.png` next to the video.
 
 ## Manual recording (OBS) and editing tips
 

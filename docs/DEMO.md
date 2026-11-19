@@ -16,7 +16,7 @@ A shot-by-shot script for the final single-page UI (`static/index.html`, refine/
    LLM_MODEL=claude-sonnet-5-5
    LLM_TIMEOUT_SECONDS=120
    ```
-   Keep the key in `.env` so it never appears on screen. Leave the UI's Model panel closed. Serve the page through `uvicorn main:app`, because CORS only allows localhost. `AI_ENGINE_DEMO=1` covers only the built-in sample, not this dataset, so don't use it here.
+   Keep the key in `.env` so it never appears on screen. Leave the UI's Model panel closed. After analysis, check that the findings header reads "model used <name>" (from the server's `X-LLM-Model-Used` header). If it says "(requested)", the server didn't confirm the model, so don't name it in the voiceover. Serve the page through `uvicorn main:app`, because CORS only allows localhost. `AI_ENGINE_DEMO=1` covers only the built-in sample, not this dataset, so don't use it here.
 2. **Run the analysis 3 times on that model** (`npm run record -- --no-video`, or click through by hand). For each run, write down:
    - which findings appear, with their severities
    - each finding's badge (Verified, Partial, Unverified or No source)
@@ -45,7 +45,7 @@ A shot-by-shot script for the final single-page UI (`static/index.html`, refine/
 **Rehearsal reference.** This is the local `qwen2.5-coder:14b` run on the merged backend in [`demo/fixtures/`](../demo/fixtures/). Use it for pacing only, not for narration.
 - **Findings:** 9 in all (1 high, 8 medium, 1 needs-info), covering NTP, 6-hour reporting, PoC, three logging-coverage gaps, log retention and log location.
 - **Badges:** 8 Verified and 1 **Unverified citation** (the log-retention finding, so it shows amber honestly).
-- **Coverage:** 24 clauses, 4 with gaps, 20 *Not flagged*.
+- **Coverage:** 22 clauses (letterhead lines are excluded), 4 with gaps, 18 *Not flagged*. Clause labels come from the server, e.g. `(ii)` or `(v) a.`.
 - **Weakness:** it rated the 6-hour gap only "medium", which is why the recording model has to be pinned and strong.
 
 ---
@@ -99,6 +99,6 @@ At about 2:25 this leaves 5 s of headroom under the 2:30 limit. If you're over, 
 
 ## Observations for the team (not changed here)
 
-1. **Header lines count as clauses.** Coverage treats the document number "20(3)/2022-CERT-In" and the "Subject: Directions under…" line as clauses (CL-001 and CL-002, both *Not flagged*). That inflates "not flagged" from about 18 to 20. Excluding reference numbers and "Subject:" lines in `grounding.is_bare_heading` would tidy the coverage shot. The recorder avoids them by featuring the "These should be provided to CERT-In…" clause instead.
+1. **Fixed upstream (a8a0c36): letterhead lines.** The document number and "Subject:" line no longer count as clauses, so CERT-In now has 22 clauses. The recorder features the "These should be provided to CERT-In…" clause, CL-012 `(iv)`, in the coverage shot.
 2. **"nearest" can score 1.00.** In the 14b fixture, ANOM-007 is `excerpt_match: "nearest"` with `excerpt_score: 1.0`, so the badge reads "Unverified citation · closest clause (1.00)". The score is word overlap (`grounding.closest_clause`), so 1.00 means every word of the model's quote appears in that clause, just not as one contiguous quote. That's correct, but on screen it looks contradictory. Showing it as "word overlap 100%", or omitting the number for `nearest`, would read better. If this badge appears in the take, don't zoom in on the score.
-3. **List items count separately.** The (v) a.–g. list items are counted as separate clauses (CL-016 to CL-022). That's correct, but it's why the clause map is long.
+3. **List items count separately.** The (v) a.–g. list items are counted as separate clauses (CL-014 to CL-020, labelled `(v) a.`–`(v) g.`). That's correct, but it's why the clause map is long.
