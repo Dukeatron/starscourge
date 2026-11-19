@@ -24,7 +24,7 @@
 // re-shoot UI-only changes. The published demo should be a live take.
 //
 // SELECTORS: everything the script touches is in SEL below, aimed at the redesigned
-// static/index.html (refine/frontend @ a12aca6). If the UI changes again, update SEL.
+// static/index.html (refine/frontend @ f39d2e1, merged). If the UI changes again, update SEL.
 
 import { chromium } from 'playwright';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
@@ -60,12 +60,18 @@ const SEL = {
   analyze: '#analyze',
   progress: '#findings .progress',                     // staged progress (cosmetic timing)
   summary: '#findings .summary',                       // donut + counters + grounding meter
-  groundMeter: '#findings .ground-meter',              // "N of N quotes found verbatim"
+  groundMeter: '#findings .ground-meter',              // "N of M quotes verified verbatim by the server"
+  covStrip: '#findings .cov-strip',                    // "N of M clauses assessed · K not flagged"
   findingCard: '#cards article.card',
-  excerptInCard: '.quote q',                           // the verbatim quote inside a card
-  badgeInCard: '.grounded',                            // "Grounded · verbatim" / "≈ Closest clause"
+  excerptInCard: '.quote q',                           // the quote inside a card
+  badgeInCard: '.grounded',                            // server-driven: Verified / Partial / Unverified / No matching source
+  verifiedBadge: '.grounded:has-text("Verified · verbatim")',
   showInSource: '[data-src]',                          // "Show in source" button inside a card
   errorVisible: '#error .alert',
+  coverageTab: '.tab[data-tab="coverage"]',
+  coverageMap: '#coverage .clause-map',                // numbered clause cells
+  coverageClause: '#coverage .clause',                 // one row per clause
+  notFlaggedClause: '#coverage .clause.nf',            // hatched amber "Review by hand"
   sourceTab: '.tab[data-tab="source"]',
   sourceMarks: '#srcText mark',                        // highlighted excerpts in the regulation
   sourceText: '#srcText',
@@ -74,6 +80,7 @@ const SEL = {
   reportHeading: '#report .md h1',
   reportSections: '#report .md h2',
   reportActions: '#report .doc-bar',                   // Download / Copy / Print
+  reportProvenance: '#report .doc-head',               // "Drafted by … (LLM)" / "Rendered deterministically" + "Draft · pending human review"
   modelDetails: '#modelDetails',
   provider: '#provider',
   model: '#model',
@@ -88,7 +95,8 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
 // ---------------------------------------------------------------- data
 const REGULATION = readFileSync(join(HERE, 'regulation.txt'), 'utf8').trim();
 const STATE = JSON.parse(readFileSync(join(HERE, 'company_state.json'), 'utf8'));
-const INJECTION_LINE = REGULATION.split('\n').find(l => /ignore all previous instructions/i.test(l)) || '';
+const NF_PREFER = /These should be provided to CERT-In/; // not-flagged clause to feature in the coverage shot
+const INJECTION_LINE =REGULATION.split('\n').find(l => /ignore all previous instructions/i.test(l)) || '';
 
 // ---------------------------------------------------------------- timeline
 const timeline = [];
@@ -142,14 +150,20 @@ async function installRoutes(context) {
   const fx = join(HERE, 'fixtures');
   const analysis = readFileSync(join(fx, 'analysis.json'), 'utf8');
   const markdown = readFileSync(join(fx, 'audit.md'), 'utf8');
+  const meta = existsSync(join(fx, 'meta.json')) ? JSON.parse(readFileSync(join(fx, 'meta.json'), 'utf8')) : {};
   const delay = FAST ? 300 : 5000; // long enough to show the progress animation
+  // /api/coverage is deterministic (no LLM), so it is NOT mocked: the real server computes it
+  // from the fixture's excerpt_span values, exactly as in a live take.
   await context.route('**/api/analyze-regulation', async route => {
     await wait(delay);
     await route.fulfill({ status: 200, contentType: 'application/json', body: analysis });
   });
   await context.route('**/api/generate-audit', async route => {
     await wait(delay);
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ anomalies: JSON.parse(analysis), markdown }) });
+    await route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ anomalies: JSON.parse(analysis), markdown, renderer: meta.audit_renderer ?? 'deterministic', model: meta.audit_model ?? null }),
+    });
   });
 }
 
@@ -277,10 +291,15 @@ async function main() {
     await page.mouse.move(SIZE.width * 0.62, 330, { steps: T.steps });
     await wait(T.longRead); // let the donut and counters animate
     await glideTo(page, page.locator(SEL.groundMeter));
-    mark('ground-meter', 'Every quote is matched back to the regulation text.');
+    mark('ground-meter', 'The server checks every quote against the regulation, and says which ones it could verify.');
     await wait(T.read);
+    if (await page.locator(SEL.covStrip).count()) {
+      await glideTo(page, page.locator(SEL.covStrip));
+      mark('coverage-strip', 'And how many clauses it assessed.');
+      await wait(T.read);
+    }
 
-    // SHOT 6 · walk the cards; check every quote is verbatim regulation text.
+    // SHOT 6 · walk the cards. Record each card's server-driven badge; check quotes are real text.
     const cards = page.locator(SEL.findingCard);
     const n = await cards.count();
     for (let i = 0; i < n; i++) {
@@ -289,42 +308,44 @@ async function main() {
       const badge = card.locator(SEL.badgeInCard);
       const title = (await card.locator('h3').innerText()).trim();
       const sev = await card.getAttribute('data-sev');
-      report.findings.push({ title, severity: sev });
+      const badgeText = (await badge.count()) ? (await badge.first().innerText()).trim().replace(/\s+/g, ' ') : 'none';
+      report.findings.push({ title, severity: sev, badge: badgeText });
+      const kind = badgeText.split(/[·(]/)[0].replace(/[^\w ]/g, '').trim() || badgeText;
+      report.grounding.badges[kind] = (report.grounding.badges[kind] || 0) + 1;
       if (await q.count()) {
         const text = (await q.first().innerText()).trim();
-        const badgeText = (await badge.count()) ? (await badge.first().innerText()).trim() : 'none';
-        report.grounding.badges[badgeText] = (report.grounding.badges[badgeText] || 0) + 1;
         report.grounding.checked++;
         if (REGULATION.includes(text)) report.grounding.verbatim++;
         else report.grounding.failures.push({ card: i, text });
       }
-      if (i < 3) { // linger on the top three; hovering lights up the company fields involved
-        await smoothScroll(card, 'center');
-        await glideTo(page, card.locator('h3'));
-        if (i === 0) mark('finding-1', 'We report in 24 hours. The direction says 6, from when we notice.');
-        if (i === 1) mark('finding-2', 'Requirement, our current value, the gap and a concrete fix.');
-        await wait(T.read);
-        if (await q.count()) await glideTo(page, q.first());
-        await wait(i === 0 ? T.longRead : T.read);
-      }
     }
-    console.log(`  grounding: ${report.grounding.verbatim}/${report.grounding.checked} excerpts are exact substrings; badges ${JSON.stringify(report.grounding.badges)}`);
-    for (const f of report.grounding.failures) console.warn(`  WARN card ${f.card} quote not verbatim: ${f.text.slice(0, 80)}`);
+    console.log(`  grounding: ${report.grounding.verbatim}/${report.grounding.checked} quotes are real regulation text; badges ${JSON.stringify(report.grounding.badges)}`);
+    for (const f of report.grounding.failures) console.warn(`  WARN card ${f.card} quote not in regulation.txt: ${f.text.slice(0, 80)}`);
 
-    // SHOT 7 · the wow: source grounding. Every excerpt is highlighted in place; the injection line is not.
+    // Linger on the top card, then on the first card whose quote the server VERIFIED (the wow shot).
+    const verified = cards.filter({ has: page.locator(SEL.verifiedBadge) });
+    const hero = (await verified.count()) ? verified.first() : cards.first();
     await smoothScroll(cards.first(), 'center');
-    const srcBtn = cards.first().locator(SEL.showInSource);
+    await glideTo(page, cards.first().locator('h3'));
+    mark('finding-1', 'Top finding: the requirement, our current value, the gap and a concrete fix.');
+    await wait(T.longRead);
+    await smoothScroll(hero, 'center');
+    const heroBadge = hero.locator(SEL.badgeInCard).first();
+    if (await heroBadge.count()) await glideTo(page, heroBadge);
+    mark('verified-badge', (await verified.count())
+      ? 'Green means the model\'s quote was found word for word in the direction.'
+      : 'No verified quote in this run: say so, do not use this shot.');
+    await wait(T.longRead);
+
+    // SHOT 7 · source grounding: the verified quote highlighted in place; the planted line is not.
+    const srcBtn = hero.locator(SEL.showInSource);
     if (await srcBtn.count()) { await glideTo(page, srcBtn); await wait(T.beat / 2); await srcBtn.click(); }
     else await click(page, SEL.sourceTab);
     await page.locator(SEL.sourceText).waitFor();
-    mark('source-grounding', 'Every quote is pinned to the exact characters it came from.');
+    mark('source-grounding', 'Every verified quote is pinned to the exact characters it came from.');
     await wait(T.longRead);
-    const marks = page.locator(SEL.sourceMarks);
-    const m = await marks.count();
-    for (let i = 0; i < Math.min(m, 4); i++) { await glideTo(page, marks.nth(i)); await wait(T.beat); }
     if (INJECTION_LINE) {
-      // #srcText is its own scroll container: scroll it (and the page) to the planted line,
-      // then point the cursor at the exact words.
+      // #srcText is its own scroll container: scroll it to the planted line and point at it.
       await smoothScroll(page.locator(SEL.sourceText), 'center');
       const rect = await page.locator(SEL.sourceText).evaluate(async (box, phrase) => {
         const walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
@@ -343,26 +364,48 @@ async function main() {
         return null;
       }, 'ignore all previous instructions');
       if (rect) await page.mouse.move(rect.x, rect.y, { steps: T.steps });
-      mark('injection', 'The planted instruction is treated as data, not a command.');
+      mark('injection', 'The planted instruction is never cited, and the gaps are still reported.');
       await wait(T.longRead);
     }
 
-    // SHOT 8 · audit log.
+    // SHOT 8 · clause coverage: what the model did NOT flag.
+    await click(page, SEL.coverageTab);
+    await page.locator(SEL.coverageMap).waitFor();
+    mark('coverage', 'Clause coverage: every clause, and which ones the model raised nothing on.');
+    await glideTo(page, page.locator(SEL.coverageMap));
+    await wait(T.read);
+    const nf = page.locator(SEL.notFlaggedClause);
+    report.coverage = { clauses: await page.locator(SEL.coverageClause).count(), notFlagged: await nf.count() };
+    if (report.coverage.notFlagged) {
+      // Prefer a real obligation the model skipped (dataset-specific: CERT-In (iv), hand logs to
+      // CERT-In with any incident report), then any "shall/should/must" clause, then the first.
+      const pick = [nf.filter({ hasText: NF_PREFER }), nf.filter({ hasText: /\b(shall|should|must)\b/ }), nf];
+      let target = nf.first();
+      for (const cand of pick) if (await cand.count()) { target = cand.first(); break; }
+      await smoothScroll(target, 'center');
+      await glideTo(page, target.locator('.nfnote, .ctext').first());
+      mark('not-flagged', 'Amber: the model raised nothing here. It tells you what it skipped, so a human checks it.');
+      await wait(T.longRead);
+    }
+    console.log(`  coverage: ${report.coverage.clauses} clauses, ${report.coverage.notFlagged} not flagged`);
+
+    // SHOT 9 · audit log: provenance + draft marker, then a quick scroll.
     await click(page, SEL.auditButton);
     mark('audit-click', 'One click drafts the working paper.');
     await page.locator(SEL.reportHeading).waitFor({ timeout: LLM_TIMEOUT_MS });
-    mark('audit-visible', 'Findings, owners, deadlines and a UTC-stamped trail, ready for review and sign-off.');
-    await page.mouse.move(SIZE.width * 0.62, 260, { steps: T.steps });
-    await wait(T.read);
+    await glideTo(page, page.locator(SEL.reportProvenance));
+    report.audit = { provenance: (await page.locator(SEL.reportProvenance).innerText()).replace(/\s+/g, ' ').trim() };
+    mark('audit-visible', 'It says who wrote it, and it is a draft pending human review.');
+    await wait(T.longRead);
     const sections = page.locator(SEL.reportSections);
-    const s = await sections.count();
+    const s = Math.min(await sections.count(), 3);
     for (let i = 0; i < s; i++) {
       await smoothScroll(sections.nth(i), 'start');
-      await wait(i === s - 1 ? T.longRead : T.read);
+      await wait(T.read);
     }
     await smoothScroll(page.locator(SEL.reportActions), 'start');
     await glideTo(page, page.locator(SEL.reportActions));
-    mark('end', 'New rule in. Grounded gaps out. Six hours, not twenty-four.');
+    mark('end', 'New rule in. Verified quotes out. Six hours, not twenty-four.');
     await wait(T.longRead);
   } catch (err) {
     mark('error');
