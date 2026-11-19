@@ -236,6 +236,36 @@ def test_analyze_response_adds_grounding_and_state_fields(fake_provider):
     assert REGULATION[start:end] == a["regulation_excerpt"]
 
 
+def test_analyze_sets_model_used_header_and_exposes_it_to_browsers(fake_provider):
+    fake_provider('{"anomalies": []}')
+    response = client.post(
+        "/api/analyze-regulation", json={"text": REGULATION},
+        headers={"X-LLM-Provider": "groq", "X-LLM-Model": "llama-x", "Origin": "http://localhost:5173"},
+    )
+    assert response.status_code == 200 and response.json() == []  # body is still a bare list
+    assert response.headers["X-LLM-Model-Used"] == "llama-x"
+    assert "x-llm-model-used" in response.headers["access-control-expose-headers"].lower()
+
+
+def test_analyze_omits_model_used_header_when_no_model_is_called(fake_provider, monkeypatch):
+    import demo_fixtures
+
+    fake_provider(AssertionError("demo mode must not call a provider"))
+    monkeypatch.setenv("AI_ENGINE_DEMO", "1")
+    response = client.post(
+        "/api/analyze-regulation",
+        json={"text": demo_fixtures.UI_SAMPLE_REGULATION, "company_state": get_compliance_state()},
+    )
+    assert response.status_code == 200 and len(response.json()) == 4
+    assert "X-LLM-Model-Used" not in response.headers
+
+
+def test_analyze_errors_carry_no_model_used_header(fake_provider):
+    fake_provider(ai_engine.LLMError("provider error: HTTP 529"))
+    response = client.post("/api/analyze-regulation", json={"text": REGULATION}, headers={"X-LLM-Model": "m"})
+    assert response.status_code == 502 and "X-LLM-Model-Used" not in response.headers
+
+
 def test_generate_audit_response_adds_renderer_and_model(fake_provider):
     fake_provider("not a valid audit log")
     anomalies = [{"id": "ANOM-001", **finding()}]
@@ -262,7 +292,7 @@ def test_coverage_endpoint_maps_findings_to_clauses(fake_provider):
     assert set(body) == {"coverage"}
     clauses = body["coverage"]
     assert [c["id"] for c in clauses] == [f"CL-{i:03d}" for i in range(1, len(clauses) + 1)]
-    assert all(set(c) == {"id", "text", "span", "status", "finding_ids"} for c in clauses)
+    assert all(set(c) == {"id", "text", "span", "status", "finding_ids", "label"} for c in clauses)
     assert all(REGULATION[c["span"][0]:c["span"][1]] == c["text"] for c in clauses)
     by_status = {c["status"]: c["finding_ids"] for c in clauses if c["finding_ids"]}
     ids = {a["title"]: a["id"] for a in anomalies}

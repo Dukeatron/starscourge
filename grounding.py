@@ -16,6 +16,7 @@ so regulation[start:end] == excerpt. No network calls, no I/O, stdlib only.
 
 from __future__ import annotations
 
+import bisect
 import difflib
 import re
 import unicodedata
@@ -63,6 +64,27 @@ _OBLIGATION_RE = re.compile(
 )
 _HEADING_START_RE = re.compile(r"^(section|article|part|chapter|schedule|annex|§|\(?\d+(\.\d+)*[.)]?\s)", re.IGNORECASE)
 _MAX_HEADING_WORDS = 8
+
+# Whole lines of a document's letterhead that are not obligations: reference numbers
+# ("No. 20(3)/2022-CERT-In") and "Subject:" / "Date:" / "To:"-style fields.
+_HEADER_LINE_RE = re.compile(
+    r"^[ \t]*(?:"
+    r"(?P<ref>(?:No|Ref|F\.[ \t]*No)\.[ \t]*[\w(][^\s]*\d[^\n]*)"
+    r"|(?P<field>(?:Subject|Sub|Date|Dated|To|From|Ref|Reference|Cc|Encl)[ \t]*:[^\n]*)"
+    r")$",
+    re.MULTILINE,
+)
+_MAX_REFERENCE_LINE_WORDS = 6
+
+# Line-start clause markers, by nesting level: "Section 4.1" / "4.1" (0), "(iv)" / "(a)"
+# / "(12)" (1), and "c." sub-items (2). Only the start of a line counts, so mid-sentence
+# cross-references such as "section 70B" are never labels.
+_LABEL_RES = (
+    (0, re.compile(r"^[ \t]*((?:Section|Article|Clause|Rule|Regulation)[ \t]+\d+[A-Za-z]?(?:\.\d+)*)\b")),
+    (0, re.compile(r"^[ \t]*(\d+(?:\.\d+)+)\.?[ \t]")),
+    (1, re.compile(r"^[ \t]*(\((?:[ivxlcdm]+|[a-z]|\d{1,3})\))[ \t]", re.IGNORECASE)),
+    (2, re.compile(r"^[ \t]*([a-z][.)])[ \t]")),
+)
 
 
 def _normalize_char(ch: str) -> str:
@@ -118,15 +140,55 @@ def is_bare_heading(sentence: str) -> bool:
     return bool(alpha) and capitalized / len(alpha) >= 0.6
 
 
+def header_line_spans(text: str) -> list[tuple[int, int]]:
+    """[start, end) of each letterhead line: a short reference number, or a Subject/Date/To field."""
+    return [
+        (m.start(), m.end())
+        for m in _HEADER_LINE_RE.finditer(text)
+        if m.group("field") or len(m.group("ref").split()) <= _MAX_REFERENCE_LINE_WORDS
+    ]
+
+
+def line_labels(text: str) -> list[tuple[int, int, str | None]]:
+    """(line start, line end, label) for every line of the text.
+
+    A line that starts with a marker gets it, prefixed by its enclosing markers (so the
+    "c." item under "(v)" is "(v) c."). A line without a marker continues the label of the
+    line above it, unless a blank line separates them (a new paragraph has no label).
+    """
+    labels: list[tuple[int, int, str | None]] = []
+    stack: list[str | None] = [None, None, None]
+    previous: str | None = None
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        start, pos = pos, pos + len(line)
+        body = line.rstrip("\r\n")
+        if not body.strip():
+            labels.append((start, start + len(body), None))
+            previous = None
+            continue
+        for level, pattern in _LABEL_RES:
+            m = pattern.match(body)
+            if m:
+                stack[level] = " ".join(m.group(1).split())
+                for deeper in range(level + 1, len(stack)):
+                    stack[deeper] = None
+                previous = " ".join(s for s in stack[: level + 1] if s)
+                break
+        labels.append((start, start + len(body), previous))
+    return labels
+
+
 @dataclass(frozen=True)
 class Clause:
-    """One sentence of the regulation, with its span in the source text."""
+    """One sentence of the regulation, with its span in the source text and its line label."""
 
     text: str
     start: int
     end: int
     norm: str
     words: frozenset[str]
+    label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -178,16 +240,26 @@ class RegulationIndex:
         return start + (len(raw) - len(raw.lstrip())), raw.strip()
 
     def clauses(self) -> list[Clause]:
-        """Obligation candidates: sentences of 15+ characters, minus bare headings and
-        instruction-like text (injection attempts). If that filter would leave nothing,
-        every sentence of 15+ characters is kept."""
+        """Obligation candidates: sentences of 15+ characters, minus bare headings,
+        letterhead lines (reference numbers, Subject/Date/To fields) and instruction-like
+        text (injection attempts). If that filter would leave nothing, every sentence of
+        15+ characters is kept. Each clause carries the label of the line it starts on."""
         if self._clauses is None:
             sentences = [s for s in _split_with_spans(self.text) if len(s[0]) >= MIN_SENTENCE_CHARS]
-            kept = [s for s in sentences if not is_bare_heading(s[0]) and not is_instruction_like(s[0])]
+            headers = header_line_spans(self.text)
+            kept = [
+                s for s in sentences
+                if not is_bare_heading(s[0]) and not is_instruction_like(s[0])
+                and not any(h_start < s[2] and s[1] < h_end for h_start, h_end in headers)
+            ]
+            lines = line_labels(self.text)
+            line_starts = [start for start, _, _ in lines]
             self._clauses = []
             for sentence, start, end in kept or sentences:
                 norm = normalized_with_map(sentence)[0]
-                self._clauses.append(Clause(sentence, start, end, norm, frozenset(WORD_RE.findall(norm))))
+                line = lines[bisect.bisect_right(line_starts, start) - 1] if lines else None
+                label = line[2] if line else None
+                self._clauses.append(Clause(sentence, start, end, norm, frozenset(WORD_RE.findall(norm)), label))
         return self._clauses
 
     def closest_clause(self, norm_excerpt: str) -> tuple[Clause | None, float]:
@@ -279,5 +351,6 @@ def build_coverage(regulation_text: str, anomalies: list[dict]) -> list[dict]:
             "span": [clause.start, clause.end],
             "status": status,
             "finding_ids": [str(a.get("id", "")) for a in hits],
+            "label": clause.label,
         })
     return coverage

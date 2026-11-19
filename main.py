@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -23,6 +23,7 @@ from ai_engine import (
     LLMError,
     LLMSetupError,
     analyze_compliance_gap,
+    analyze_compliance_report,
     build_coverage,
     generate_audit_report as engine_audit_report,
 )
@@ -47,12 +48,14 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-LLM-Model-Used"],  # readable by cross-origin browser code
 )
 
 API_KEY_HEADER = "X-LLM-Api-Key"
 LEGACY_KEY_HEADER = "X-Anthropic-Api-Key"
 PROVIDER_HEADER = "X-LLM-Provider"
 MODEL_HEADER = "X-LLM-Model"
+MODEL_USED_HEADER = "X-LLM-Model-Used"  # response: the model /api/analyze-regulation called
 
 
 def _call_engine(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -130,10 +133,18 @@ def system_state():
 
 
 @app.post("/api/analyze-regulation")
-def analyze_regulation(request: RegulationAnalysisRequest, llm: dict = Depends(llm_options)):
-    """Analyze regulation text against the company profile. Returns the list of anomalies."""
+def analyze_regulation(request: RegulationAnalysisRequest, response: Response, llm: dict = Depends(llm_options)):
+    """Analyze regulation text against the company profile. Returns the list of anomalies.
+
+    The X-LLM-Model-Used response header names the model that was called; it is omitted
+    when no model was called (demo mode). The body stays a bare list.
+    """
     state = request.company_state if request.company_state is not None else get_compliance_state()
-    return _call_engine(analyze_compliance_gap, request.text, state, **llm)
+    report = _call_engine(analyze_compliance_report, request.text, state, **llm)
+    model_used = report["model"]
+    if model_used and model_used.isascii() and model_used.isprintable():  # header-safe values only
+        response.headers[MODEL_USED_HEADER] = model_used
+    return report["anomalies"]
 
 
 @app.post("/api/generate-audit")
