@@ -1,0 +1,17 @@
+{
+  "company": "PaySetu Payments Pvt. Ltd.",
+  "licence": "Payment Aggregator (online)",
+  "primary_data_region": "ap-south-1 (Mumbai)",
+  "backup_region": "us-east-1 (N. Virginia)",
+  "transaction_record_retention_years": 2,
+  "system_log_retention_days": 90,
+  "account_closure_erasure_days": 180,
+  "encryption_at_rest": "AES-256",
+  "tls_min_version": "1.0",
+  "incident_reporting_sla_hours": 24,
+  "privileged_access_mfa": true,
+  "privileged_access_review": "annual",
+  "grievance_officer_published": false,
+  "consent_logging": "timestamped, per purpose",
+  "consent_withdrawal": "in-app opt-in; withdrawal only by email to support"
+}
