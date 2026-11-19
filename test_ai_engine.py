@@ -583,7 +583,7 @@ def test_client_is_singleton_and_rebuilt_on_key_change(no_key, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "key-one")
     first = ai_engine._get_client()
     assert ai_engine._get_client() is first
-    assert first.max_retries == 3
+    assert first.max_retries == ai_engine.SDK_MAX_RETRIES == 1
     monkeypatch.setenv("ANTHROPIC_API_KEY", "key-two")
     assert ai_engine._get_client() is not first
 
@@ -746,6 +746,16 @@ def _bad_request(message):
 )
 def test_provider_detected_from_key_prefix(no_key, key, provider):
     assert ai_engine._resolve_provider(None, key) == provider
+
+
+def test_env_keys_alone_never_select_a_provider(no_key, monkeypatch):
+    """Matches .env.example: request provider, then key prefix, then LLM_PROVIDER, then ollama."""
+    monkeypatch.delenv("LLM_PROVIDER")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    assert ai_engine._resolve_provider() == "ollama"
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+    assert ai_engine._resolve_provider(None, "sk-ant-x") == "anthropic"
+    assert ai_engine._resolve_provider("openai", "sk-ant-x") == "openai"
 
 
 def test_explicit_provider_wins_over_key_prefix(no_key):

@@ -75,7 +75,9 @@ DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_EFFORT = "medium"
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CONNECT_TIMEOUT_SECONDS = 5.0  # an unreachable host fails in seconds, not LLM_TIMEOUT_SECONDS
-SDK_MAX_RETRIES = 3  # SDK retries of transient HTTP failures (429, 5xx, dropped connections)
+# One SDK retry rides out a transient 429, 5xx or dropped connection. More would multiply
+# the worst case: each retried read timeout waits the full LLM_TIMEOUT_SECONDS again.
+SDK_MAX_RETRIES = 1
 # Local Ollama has no rate limits or flaky network to ride out, and retrying a read
 # timeout would re-run the whole (slow) local generation, so it fails at once.
 LOCAL_MAX_RETRIES = 0
