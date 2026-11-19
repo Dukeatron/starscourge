@@ -77,8 +77,11 @@ def main() -> int:
         return 1
 
     try:
-        markdown = post(a.base_url, "/api/generate-audit", {"anomalies": anomalies}, headers, a.timeout)["markdown"]
+        resp = post(a.base_url, "/api/generate-audit", {"anomalies": anomalies}, headers, a.timeout)
+        markdown = resp["markdown"]
         meta["audit_source"] = "live /api/generate-audit"
+        meta["audit_renderer"] = resp.get("renderer")  # "llm" | "deterministic"
+        meta["audit_model"] = resp.get("model")
     except (urllib.error.URLError, TimeoutError, KeyError) as exc:
         sys.path.insert(0, str(ROOT))
         import ai_engine
@@ -90,6 +93,8 @@ def main() -> int:
             items, now.strftime("%Y-%m-%dT%H:%M:%SZ"), "AUD-" + now.strftime("%Y%m%dT%H%M%SZ"), meta["model"]
         )
         meta["audit_source"] = "ai_engine._render_audit_fallback (deterministic, no LLM)"
+        meta["audit_renderer"] = "deterministic"
+        meta["audit_model"] = None
 
     FIXTURES.mkdir(exist_ok=True)
     (FIXTURES / "analysis.json").write_text(json.dumps(anomalies, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -97,6 +102,7 @@ def main() -> int:
     meta["findings"] = len(anomalies)
     meta["severities"] = {s: sum(x["severity"] == s for x in anomalies) for s in ("critical", "high", "medium", "low")}
     meta["needs_info"] = sum(x["gap_type"] == "insufficient_information" for x in anomalies)
+    meta["excerpt_match"] = {m: sum(x.get("excerpt_match") == m for x in anomalies) for m in ("exact", "fragment", "nearest", "none")}
     (FIXTURES / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(meta, indent=2))
     return 0

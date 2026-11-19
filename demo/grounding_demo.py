@@ -1,26 +1,27 @@
-"""Demo: a model cannot put an invented quote into the findings.
+"""Demo: an invented quote is never presented as a verified citation.
 
 Run from the repo root (offline, no key, no network):
 
     python demo/grounding_demo.py             # all cases
     python demo/grounding_demo.py --case 1    # just the fabricated-clause case (the video shot)
 
-A "lying model" stands in for the LLM and returns findings whose
-`regulation_excerpt` is (1) a fabricated clause that would make the company look
-compliant, (2) a correct quote with odd casing and whitespace, and (3) a loose
-paraphrase. Each goes through the real public `analyze_compliance_gap()` pipeline.
-The script prints what the model claimed next to what the engine returned, and
-checks that every returned excerpt is an exact substring of the regulation.
+A "lying model" stands in for the LLM and returns findings whose `regulation_excerpt`
+is (1) a fabricated 24-hour clause that would make the company look compliant,
+(2) a real quote with odd casing and whitespace, (3) a loose paraphrase, and (4) a
+quote about something the regulation never mentions. Each one goes through the real
+public `analyze_compliance_gap()` pipeline. The script prints what the model wrote,
+how the server classified it (`excerpt_match`), the badge the UI shows for that
+class, and the text the finding now cites.
 
-What this proves, and what it does not:
-- Proven: whatever the model writes, the excerpt that reaches the findings and the
-  audit log is real text from the submitted regulation.
-- Not proven: that it is the right clause. When the model's quote is not found, the
-  engine substitutes the most similar sentence (case 3 can land on the wrong clause),
-  and the API does not currently say which path was taken. A human still reviews.
+What this shows (checked against the real output, not assumed):
+- Only a quote found in the source is marked "exact" (UI: "Verified · verbatim").
+- An invented or paraphrased quote is marked "nearest" (UI: amber "Unverified citation
+  · closest clause") or "none" (UI: red "No matching source"). The finding then cites
+  the closest real clause, which can be the WRONG clause (case 3). That is why it is
+  flagged for a human, not presented as verified.
 
 Only the network call is swapped (the same seam the offline test suite uses). The
-grounding code under test is the production code in ai_engine.py.
+grounding code under test is the production code in grounding.py and ai_engine.py.
 """
 
 from __future__ import annotations
@@ -51,25 +52,34 @@ def c(code: str, text: str) -> str:
 
 RED, GREEN, YELLOW, DIM, BOLD = "31", "32", "33", "2", "1"
 
+# What static/index.html shows for each server-side match class, and its colour here.
+BADGE = {
+    "exact": ("Verified · verbatim", GREEN),
+    "fragment": ("Partial quote", YELLOW),
+    "nearest": ("Unverified citation · closest clause", YELLOW),
+    "none": ("No matching source", RED),
+}
+
 CASES = [
     {
-        "label": "Fabricated clause: 24 hours, which would make PaySetu look compliant",
+        "label": "Invented clause: 24 hours, which would make PaySetu look compliant",
         "title": "Incident reporting SLA",
         "excerpt": "Body corporates shall report cyber incidents to CERT-In within 24 hours of completing internal triage.",
-        "note": "The invented 24-hour clause never reaches the file. The real 6-hour text does.",
     },
     {
         "label": "Real quote, sloppy formatting",
         "title": "Point of Contact not registered",
         "excerpt": "“SHALL DESIGNATE a Point of Contact   to interface with CERT-In”",
-        "note": "Snapped to the exact characters in the source.",
     },
     {
-        "label": "Loose paraphrase (limitation)",
+        "label": "Loose paraphrase",
         "title": "Logs stored outside India",
         "excerpt": "ICT logs have to be kept for six months on servers in India",
-        "note": "Real text, but check the clause: closest-sentence matching can pick the wrong one. "
-        "This is why findings are reviewed by a human.",
+    },
+    {
+        "label": "Quote about something the direction never mentions",
+        "title": "Quantum-safe cryptography",
+        "excerpt": "Entities must migrate to post-quantum cryptography by 2027.",
     },
 ]
 
@@ -103,30 +113,41 @@ def main() -> int:
     result = ai_engine.analyze_compliance_gap(REGULATION, STATE)
     by_title = {a["title"]: a for a in result}
 
-    print(c(BOLD, "\nCan a model slip an invented quote into the findings?\n"))
-    all_ok = True
+    print(c(BOLD, "\nThe model invents a quote. Does it get presented as verified?\n"))
+    ok = True
     for i, case in enumerate(CASES, start=1):
         if ONLY and i != ONLY:
             continue
-        filed = by_title[case["title"]]["regulation_excerpt"]
-        verbatim = filed in REGULATION
-        all_ok &= verbatim
+        a = by_title.get(case["title"])
+        if a is None:  # the engine may drop a finding outright
+            print(c(BOLD, f"[{i}] {case['label']}"), c(DIM, "-> finding dropped by the engine\n"))
+            continue
+        match, score = a.get("excerpt_match"), a.get("excerpt_score")
+        badge, color = BADGE.get(match, (f"unknown match '{match}'", RED))
+        invented = i != 2
+        # The property we demo: invented or paraphrased quotes are never "exact".
+        ok &= not (invented and match == "exact")
+        ok &= a["regulation_excerpt"] in REGULATION
+
         print(c(BOLD, f"[{i}] {case['label']}"))
         time.sleep(PAUSE)
-        print(c(RED, "  model wrote:"))
-        print(c(RED, wrap(case["excerpt"], "    ")))
+        print(c(RED if invented else DIM, "  model wrote:"))
+        print(c(RED if invented else DIM, wrap(case["excerpt"], "    ")))
         time.sleep(PAUSE)
-        print(c(GREEN, "  engine filed:"))
-        print(c(GREEN, wrap(filed, "    ")))
-        status = "exact substring of the regulation" if verbatim else "NOT FOUND IN REGULATION"
-        print(c(DIM if verbatim else RED, f"    -> {status}. {case['note']}\n"))
+        score_txt = f" (score {score:.2f})" if isinstance(score, (int, float)) else ""
+        print(c(color + ";" + BOLD, f"  server: excerpt_match = {match}{score_txt}  ->  UI badge \"{badge}\""))
+        time.sleep(PAUSE)
+        label = "  finding now cites (real text, for a human to check):" if match != "exact" else "  finding cites:"
+        print(c(DIM, label))
+        print(wrap(a["regulation_excerpt"], "    "))
+        print()
         time.sleep(PAUSE)
 
-    if all_ok:
-        print(c(GREEN + ";" + BOLD, "Every filed excerpt is verbatim regulation text."))
+    if ok:
+        print(c(GREEN + ";" + BOLD, "No invented quote was marked verified. Only the real quote got the green badge."))
     else:
-        print(c(RED + ";" + BOLD, "A non-verbatim excerpt got through."))
-    return 0 if all_ok else 1
+        print(c(RED + ";" + BOLD, "An invented quote was marked verified, or a cited excerpt is not regulation text."))
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
