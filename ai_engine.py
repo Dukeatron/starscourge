@@ -487,6 +487,50 @@ def _anthropic_complete(
     return text
 
 
+# Request parameters that some OpenAI-compatible providers or models reject, and the
+# simpler request to try instead. Each step is applied only if it fits the request.
+_MAX_REQUESTS_PER_CALL = 5  # the original request plus up to four relaxations
+_MAX_LEARNED_MODELS = 256
+_learned_relaxations: dict[tuple[str, str], list[str]] = {}
+_learned_lock = threading.Lock()
+
+
+def _relaxation_for(kwargs: dict[str, Any], detail: str) -> str | None:
+    """The relaxation that answers a BadRequestError message, or None if it is unrelated."""
+    if "temperature" in kwargs and "temperature" in detail:
+        return "drop_temperature"
+    if "max_tokens" in kwargs and "max_tokens" in detail:
+        return "use_max_completion_tokens"
+    if "max_completion_tokens" in kwargs and "max_completion_tokens" in detail:
+        return "use_max_tokens"
+    if "response_format" in kwargs and any(w in detail for w in ("response_format", "json", "schema")):
+        return "json_object" if kwargs["response_format"]["type"] == "json_schema" else "drop_response_format"
+    return None
+
+
+def _apply_relaxation(kwargs: dict[str, Any], step: str) -> None:
+    """Simplify the request in place; a step that does not fit this request is skipped."""
+    if step == "drop_temperature":
+        kwargs.pop("temperature", None)
+    elif step == "use_max_completion_tokens" and "max_tokens" in kwargs:
+        kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+    elif step == "use_max_tokens" and "max_completion_tokens" in kwargs:
+        kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+    elif step == "json_object" and kwargs.get("response_format", {}).get("type") == "json_schema":
+        kwargs["response_format"] = {"type": "json_object"}
+    elif step == "drop_response_format":
+        kwargs.pop("response_format", None)
+
+
+def _remember_relaxation(key: tuple[str, str], step: str) -> None:
+    with _learned_lock:
+        if key not in _learned_relaxations and len(_learned_relaxations) >= _MAX_LEARNED_MODELS:
+            return
+        steps = _learned_relaxations.setdefault(key, [])
+        if step not in steps:
+            steps.append(step)
+
+
 def _openai_compatible_complete(
     client: Any, provider: str, model_name: str, prompt: str, system_message: str,
     json_mode: bool, schema: dict | None, temperature: float, max_tokens: int,
@@ -520,28 +564,24 @@ def _openai_compatible_complete(
             else {"type": "json_object"}
         )
 
+    # Replay what this provider and model rejected before, saving a failed round trip each.
+    learned_key = (provider, model_name)
+    for step in _learned_relaxations.get(learned_key, ()):
+        _apply_relaxation(kwargs, step)
+
     response = None
     try:
-        for _ in range(5):
+        for _ in range(_MAX_REQUESTS_PER_CALL):
             try:
                 response = client.chat.completions.create(**kwargs)
                 break
             except openai.BadRequestError as exc:
-                detail = str(exc).lower()
-                if "temperature" in kwargs and "temperature" in detail:
-                    kwargs.pop("temperature")
-                elif "max_tokens" in kwargs and "max_tokens" in detail:
-                    kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
-                elif "max_completion_tokens" in kwargs and "max_completion_tokens" in detail:
-                    kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
-                elif "response_format" in kwargs and any(w in detail for w in ("response_format", "json", "schema")):
-                    if kwargs["response_format"]["type"] == "json_schema":
-                        kwargs["response_format"] = {"type": "json_object"}
-                    else:
-                        kwargs.pop("response_format")
-                else:
+                step = _relaxation_for(kwargs, str(exc).lower())
+                if step is None:
                     raise
-                logger.info("provider %s rejected a parameter; retrying with a simpler request", provider)
+                _apply_relaxation(kwargs, step)
+                _remember_relaxation(learned_key, step)
+                logger.info("provider %s rejected a parameter; retrying with %s", provider, step)
     except (openai.AuthenticationError, openai.PermissionDeniedError) as exc:
         raise LLMConfigError(f"the API key was rejected by {provider} ({type(exc).__name__})") from exc
     except openai.NotFoundError as exc:

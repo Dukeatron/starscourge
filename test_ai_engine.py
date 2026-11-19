@@ -70,6 +70,12 @@ class FakeProvider:
         return out
 
 
+@pytest.fixture(autouse=True)
+def fresh_learned_relaxations(monkeypatch):
+    """Parameter fallbacks learned from one test's fake provider must not leak into another."""
+    monkeypatch.setattr(ai_engine, "_learned_relaxations", {})
+
+
 @pytest.fixture
 def provider(monkeypatch):
     def install(*outputs):
@@ -904,6 +910,31 @@ def test_openai_compatible_degrades_rejected_parameters():
     assert "temperature" not in client.requests[-1]
     assert "response_format" not in client.requests[-1]
     assert len(client.requests) == 4
+
+
+def test_rejected_parameters_are_remembered_per_provider_and_model():
+    errors = [
+        _bad_request("Unsupported value: 'temperature' does not support 0.0"),
+        _bad_request("response_format json_schema is not supported for this model"),
+    ]
+    first = FakeOpenAIClient('{"anomalies": []}', errors=errors)
+    ai_engine._openai_compatible_complete(first, "groq", "llama", "p", "s", True, ai_engine.ANALYSIS_SCHEMA, 0.0, 99)
+    assert len(first.requests) == 3
+
+    second = FakeOpenAIClient('{"anomalies": []}')
+    ai_engine._openai_compatible_complete(second, "groq", "llama", "p", "s", True, ai_engine.ANALYSIS_SCHEMA, 0.0, 99)
+    assert len(second.requests) == 1  # no failed round trips the second time
+    assert "temperature" not in second.requests[0]
+    assert second.requests[0]["response_format"] == {"type": "json_object"}
+
+    text_mode = FakeOpenAIClient("hello")
+    ai_engine._openai_compatible_complete(text_mode, "groq", "llama", "p", "", False, None, 0.0, 99)
+    assert "response_format" not in text_mode.requests[0] and "temperature" not in text_mode.requests[0]
+
+    other_model = FakeOpenAIClient('{"anomalies": []}')
+    ai_engine._openai_compatible_complete(other_model, "groq", "other", "p", "s", True, ai_engine.ANALYSIS_SCHEMA, 0.0, 99)
+    assert other_model.requests[0]["response_format"]["type"] == "json_schema"
+    assert other_model.requests[0]["temperature"] == 0.0
 
 
 def test_openai_compatible_unrelated_bad_request_is_llm_error():
