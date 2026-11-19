@@ -54,6 +54,7 @@ from prompts import (
 __all__ = [
     "LLMError",
     "LLMConfigError",
+    "LLMSetupError",
     "LLMOutputError",
     "call_llm",
     "analyze_compliance_gap",
@@ -102,6 +103,12 @@ class LLMConfigError(LLMError):
     """Missing API key or bad configuration."""
 
 
+class LLMSetupError(LLMConfigError):
+    """Configuration that a different API key would not fix: an unknown model, an invalid
+    LLM_* environment variable, or a missing dependency. A subclass of LLMConfigError, so
+    existing handlers still catch it; the API reports it as a server error, not as 401."""
+
+
 class LLMOutputError(LLMError):
     """The model's output was unusable after all retries."""
 
@@ -116,16 +123,16 @@ def _timeout_seconds() -> float:
     try:
         value = float(raw)
     except ValueError:
-        raise LLMConfigError("LLM_TIMEOUT_SECONDS must be a number") from None
+        raise LLMSetupError("LLM_TIMEOUT_SECONDS must be a number") from None
     if value <= 0:
-        raise LLMConfigError("LLM_TIMEOUT_SECONDS must be positive")
+        raise LLMSetupError("LLM_TIMEOUT_SECONDS must be positive")
     return value
 
 
 def _effort() -> str:
     raw = os.environ.get("LLM_EFFORT", "").strip().lower() or DEFAULT_EFFORT
     if raw not in VALID_EFFORTS:
-        raise LLMConfigError(f"LLM_EFFORT must be one of {', '.join(VALID_EFFORTS)}")
+        raise LLMSetupError(f"LLM_EFFORT must be one of {', '.join(VALID_EFFORTS)}")
     return raw
 
 
@@ -225,7 +232,7 @@ def _env_provider() -> str:
     configured = os.environ.get("LLM_PROVIDER", "").strip().lower()
     if configured:
         if configured not in PROVIDERS:
-            raise LLMConfigError(f"LLM_PROVIDER must be one of {', '.join(PROVIDERS)}")
+            raise LLMSetupError(f"LLM_PROVIDER must be one of {', '.join(PROVIDERS)}")
         return configured
     return DEFAULT_PROVIDER
 
@@ -304,7 +311,7 @@ def _resolve_model(provider: str, model: str | None = None) -> str:
         return _smallest_ollama_model()
     default = _OPENAI_COMPATIBLE[provider][2]
     if not default:
-        raise LLMConfigError("provider 'custom' needs a model: pass model= or set LLM_MODEL")
+        raise LLMSetupError("provider 'custom' needs a model: pass model= or set LLM_MODEL")
     return default
 
 
@@ -316,7 +323,7 @@ def _resolve_base_url(provider: str) -> str | None:
     if provider == "custom":
         override = override or os.environ.get("LLM_BASE_URL", "").strip()
         if not override:
-            raise LLMConfigError("provider 'custom' needs LLM_BASE_URL")
+            raise LLMSetupError("provider 'custom' needs LLM_BASE_URL")
     return override or _OPENAI_COMPATIBLE[provider][0]
 
 
@@ -369,7 +376,7 @@ def _get_client(api_key: str | None = None, provider: str | None = None) -> Any:
             try:
                 import openai
             except ImportError:
-                raise LLMConfigError(f"provider '{name}' needs the openai package: pip install openai") from None
+                raise LLMSetupError(f"provider '{name}' needs the openai package: pip install openai") from None
             client = openai.OpenAI(
                 api_key=key, base_url=base_url, timeout=openai.Timeout(timeout, connect=connect),
                 max_retries=LOCAL_MAX_RETRIES if name == "ollama" else SDK_MAX_RETRIES,
@@ -460,7 +467,7 @@ def _anthropic_complete(
     except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
         raise LLMConfigError(f"the API key was rejected by the provider ({type(exc).__name__})") from exc
     except anthropic.NotFoundError as exc:
-        raise LLMConfigError(f"model '{model_name}' not found") from exc
+        raise LLMSetupError(f"model '{model_name}' not found") from exc
     except anthropic.APIStatusError as exc:
         raise LLMError(f"provider error: HTTP {exc.status_code} ({type(exc).__name__})") from exc
     except anthropic.APIConnectionError as exc:  # includes APITimeoutError
@@ -538,7 +545,8 @@ def _openai_compatible_complete(
     except (openai.AuthenticationError, openai.PermissionDeniedError) as exc:
         raise LLMConfigError(f"the API key was rejected by {provider} ({type(exc).__name__})") from exc
     except openai.NotFoundError as exc:
-        raise LLMConfigError(f"model '{model_name}' not found at {provider}") from exc
+        hint = f": pull it with `ollama pull {model_name}` or set OLLAMA_MODEL" if provider == "ollama" else ""
+        raise LLMSetupError(f"model '{model_name}' not found at {provider}{hint}") from exc
     except openai.APIStatusError as exc:
         raise LLMError(f"{provider} error: HTTP {exc.status_code} ({type(exc).__name__})") from exc
     except openai.APIConnectionError as exc:  # includes APITimeoutError

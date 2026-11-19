@@ -191,7 +191,8 @@ uvicorn main:app --reload          # http://127.0.0.1:8000/docs
 - Errors return a `detail.error` code:
   - **422:** `INVALID_INPUT`, for bad input.
   - **401:** `LLM_AUTH`, when the key is missing or rejected.
-  - **502:** `LLM_UNAVAILABLE`, when the provider fails.
+  - **500:** `LLM_CONFIG`, when the server's LLM setup is wrong in a way a key won't fix (unknown model, invalid `LLM_*` setting).
+  - **502:** `LLM_UNAVAILABLE`, when the provider fails, can't be reached (e.g. Ollama isn't running) or times out.
 
 ### Contract for the API layer
 
@@ -205,6 +206,6 @@ markdown  = generate_audit_trail(anomalies, api_key=user_key)                   
 - Each anomaly has exactly these keys: `id`, `title`, `category`, `severity`, `gap_type`, `regulation_requirement`, `regulation_excerpt`, `current_state`, `gap_description` and `recommended_remediation`. The list is sorted critical → low.
 - Both functions are synchronous. Call them from a plain `def` route, or use `run_in_threadpool`.
 - `ValueError` means bad input (HTTP 400/422).
-- `LLMConfigError` means a missing or rejected key (HTTP 401/500).
+- `LLMConfigError` means a missing or rejected key (HTTP 401). Its subclass `LLMSetupError` means a server-side setup problem such as an unknown model (HTTP 500).
 - Any other `LLMError` means the provider failed (HTTP 502).
 - No other exception type escapes.

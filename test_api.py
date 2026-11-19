@@ -186,6 +186,29 @@ def test_provider_failure_maps_to_502(fake_provider):
     assert response.json()["detail"]["error"] == "LLM_UNAVAILABLE"
 
 
+def test_unknown_model_maps_to_500_not_401(fake_provider):
+    fake_provider(ai_engine.LLMSetupError("model 'nope' not found at ollama: pull it with `ollama pull nope`"))
+    response = client.post("/api/analyze-regulation", json={"text": REGULATION})
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert detail["error"] == "LLM_CONFIG" and "ollama pull nope" in detail["message"]
+    assert "X-LLM-Api-Key" not in detail["message"]  # a key would not fix this
+
+
+def test_bad_server_env_maps_to_500(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "not-a-provider")
+    response = client.post("/api/analyze-regulation", json={"text": REGULATION})
+    assert response.status_code == 500
+    assert response.json()["detail"]["error"] == "LLM_CONFIG"
+
+
+def test_ollama_down_maps_to_502_with_actionable_message(fake_provider):
+    fake_provider(ai_engine._connection_error("ollama", RuntimeError(), TimeoutError))
+    response = client.post("/api/analyze-regulation", json={"text": REGULATION})
+    assert response.status_code == 502
+    assert "ollama serve" in response.json()["detail"]["message"]
+
+
 def test_persistent_bad_output_maps_to_502(fake_provider):
     fake_provider("garbage")
     assert client.post("/api/analyze-regulation", json={"text": REGULATION}).status_code == 502

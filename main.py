@@ -16,7 +16,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pathlib import Path
 
-from ai_engine import PROVIDERS, LLMConfigError, LLMError, analyze_compliance_gap, generate_audit_trail
+from ai_engine import (
+    PROVIDERS,
+    LLMConfigError,
+    LLMError,
+    LLMSetupError,
+    analyze_compliance_gap,
+    generate_audit_trail,
+)
 from mock_db import get_compliance_state
 from models import AuditGenerationRequest, RegulationAnalysisRequest
 
@@ -39,11 +46,19 @@ MODEL_HEADER = "X-LLM-Model"
 
 
 def _call_engine(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """Run an engine function and map its errors to HTTP status codes."""
+    """Run an engine function and map its errors to HTTP status codes.
+
+    ValueError -> 422 INVALID_INPUT; missing or rejected key -> 401 LLM_AUTH; server-side
+    LLM setup (unknown model, bad LLM_* env) -> 500 LLM_CONFIG; any other LLMError (provider
+    down, timeout, unusable output) -> 502 LLM_UNAVAILABLE. Messages never contain keys.
+    """
     try:
         return function(*args, **kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"error": "INVALID_INPUT", "message": str(exc)})
+    except LLMSetupError as exc:
+        logger.warning("LLM setup error: %s", exc)
+        raise HTTPException(status_code=500, detail={"error": "LLM_CONFIG", "message": str(exc)})
     except LLMConfigError as exc:
         raise HTTPException(
             status_code=401,
