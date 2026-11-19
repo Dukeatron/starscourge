@@ -35,7 +35,7 @@ import threading
 import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal, TypeVar
 
 import anthropic
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -61,6 +61,7 @@ __all__ = [
 ]
 
 logger = logging.getLogger("ai_engine")
+T = TypeVar("T")
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -574,7 +575,39 @@ def call_llm(
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         raise ValueError("max_tokens must be a positive integer")
     _check_llm_args(api_key, provider, model)
+    return _complete_with_retries(
+        prompt, system_message, json_mode, schema, temperature, max_tokens,
+        _coerce_json_object if json_mode else _require_text,
+        api_key=api_key, provider=provider, model=model,
+    )
 
+
+def _require_text(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise LLMOutputError(f"expected text, got {type(raw).__name__}")
+    return raw
+
+
+def _complete_with_retries(
+    prompt: str,
+    system_message: str,
+    json_mode: bool,
+    schema: dict | None,
+    temperature: float,
+    max_tokens: int,
+    parse: Callable[[Any], T],
+    *,
+    api_key: str | None,
+    provider: str | None,
+    model: str | None,
+) -> T:
+    """Call the provider and `parse` its output, re-asking on unusable output.
+
+    `parse` raises LLMOutputError for output it cannot use (bad JSON, failed schema
+    validation, ...). Every kind of unusable output shares one budget of MAX_ATTEMPTS
+    model calls. Provider and config errors are raised at once, never retried here (the
+    SDK already retries transient HTTP failures), and no other exception type escapes.
+    """
     last_error: LLMOutputError | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -582,18 +615,14 @@ def call_llm(
                 prompt, system_message, json_mode, schema, temperature, max_tokens,
                 api_key=api_key, provider=provider, model=model,
             )
-            if json_mode:
-                return _coerce_json_object(raw)
-            if not isinstance(raw, str):
-                raise LLMOutputError(f"expected text, got {type(raw).__name__}")
-            return raw
+            return parse(raw)
         except LLMOutputError as exc:
             last_error = exc
-            logger.warning("call_llm attempt %d/%d: unusable output (%s)", attempt, MAX_ATTEMPTS, exc)
+            logger.warning("LLM attempt %d/%d: unusable output (%s)", attempt, MAX_ATTEMPTS, exc)
         except LLMError:
             raise
         except Exception as exc:  # never let an unexpected type escape
-            logger.error("call_llm attempt %d: unexpected %s", attempt, type(exc).__name__)
+            logger.error("LLM attempt %d: unexpected %s", attempt, type(exc).__name__)
             raise LLMError(f"unexpected error: {type(exc).__name__}") from exc
     raise LLMOutputError(f"unusable output after {MAX_ATTEMPTS} attempts: {last_error}")
 
@@ -838,24 +867,20 @@ def analyze_compliance_gap(
     state_json = _validate_analysis_inputs(regulation_text, current_company_state_dict)
     _check_llm_args(api_key, provider, model)
     prompt = build_analysis_prompt(regulation_text, state_json)
+    # Bad JSON and schema-invalid JSON share one budget of MAX_ATTEMPTS model calls.
+    parsed = _complete_with_retries(
+        prompt, ANALYSIS_SYSTEM_PROMPT, True, ANALYSIS_SCHEMA, 0.0, DEFAULT_MAX_TOKENS,
+        _parse_analysis, api_key=api_key, provider=provider, model=model,
+    )
+    return _finalize_anomalies(parsed.anomalies, regulation_text)
 
-    # call_llm already retries unusable output (and its LLMOutputError propagates), so
-    # this loop only re-asks when the JSON parses but fails schema validation.
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        payload = call_llm(
-            prompt, ANALYSIS_SYSTEM_PROMPT, json_mode=True, schema=ANALYSIS_SCHEMA,
-            api_key=api_key, provider=provider, model=model,
-        )
-        try:
-            parsed = _AnalysisPayload.model_validate(payload)
-        except ValidationError as exc:
-            logger.warning(
-                "analyze_compliance_gap attempt %d/%d: schema validation failed (%d errors)",
-                attempt, MAX_ATTEMPTS, exc.error_count(),
-            )
-            continue
-        return _finalize_anomalies(parsed.anomalies, regulation_text)
-    raise LLMOutputError(f"analysis output failed schema validation {MAX_ATTEMPTS} times")
+
+def _parse_analysis(raw: Any) -> _AnalysisPayload:
+    """Parse and schema-validate the analysis output; LLMOutputError if it is unusable."""
+    try:
+        return _AnalysisPayload.model_validate(_coerce_json_object(raw))
+    except ValidationError as exc:
+        raise LLMOutputError(f"analysis output failed schema validation ({exc.error_count()} errors)") from None
 
 
 # --------------------------------------------------------------------------- audit trail

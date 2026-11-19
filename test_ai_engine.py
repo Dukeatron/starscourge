@@ -455,6 +455,19 @@ def test_persistent_output_error_is_capped_at_three_calls(provider):
     assert len(fake.calls) == 3
 
 
+def test_mixed_bad_json_and_schema_failures_share_one_budget_of_three_calls(provider):
+    fake = provider("garbage", {"anomalies": [make_anomaly(severity="urgent")]}, "garbage", "garbage")
+    with pytest.raises(LLMOutputError):
+        analyze_compliance_gap(REGULATION, STATE)
+    assert len(fake.calls) == 3  # was up to 9 (3 schema retries x 3 parse retries)
+
+
+def test_bad_json_then_schema_failure_then_valid_recovers(provider):
+    fake = provider("garbage", {"anomalies": [make_anomaly(severity="urgent")]}, {"anomalies": [make_anomaly()]})
+    assert len(analyze_compliance_gap(REGULATION, STATE)) == 1
+    assert len(fake.calls) == 3
+
+
 def test_audit_persistent_output_error_goes_to_fallback_after_three_calls(provider):
     fake = provider(LLMOutputError("truncated"))
     md = generate_audit_trail(anomalies_with_ids(), generated_at=GENERATED_AT)
