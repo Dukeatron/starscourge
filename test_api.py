@@ -249,6 +249,39 @@ def test_generate_audit_response_adds_renderer_and_model(fake_provider):
     assert (empty["renderer"], empty["model"]) == ("deterministic", None)
 
 
+def test_coverage_endpoint_maps_findings_to_clauses(fake_provider):
+    calls = fake_provider(json.dumps({"anomalies": [finding(), finding(
+        title="No DPO", gap_type="insufficient_information", gap_description="DPO unknown",
+        regulation_excerpt="Every regulated entity must appoint a Data Protection Officer (DPO)",
+    )]}))
+    anomalies = client.post("/api/analyze-regulation", json={"text": REGULATION}).json()
+    calls.clear()
+    response = client.post("/api/coverage", json={"text": REGULATION, "anomalies": anomalies})
+    assert response.status_code == 200 and calls == []  # deterministic, no LLM
+    body = response.json()
+    assert set(body) == {"coverage"}
+    clauses = body["coverage"]
+    assert [c["id"] for c in clauses] == [f"CL-{i:03d}" for i in range(1, len(clauses) + 1)]
+    assert all(set(c) == {"id", "text", "span", "status", "finding_ids"} for c in clauses)
+    assert all(REGULATION[c["span"][0]:c["span"][1]] == c["text"] for c in clauses)
+    by_status = {c["status"]: c["finding_ids"] for c in clauses if c["finding_ids"]}
+    ids = {a["title"]: a["id"] for a in anomalies}
+    assert by_status["gap"] == [ids["Data retention period too short"]]
+    assert by_status["needs_info"] == [ids["No DPO"]]
+    assert sum(c["status"] == "not_flagged" for c in clauses) == len(clauses) - 2
+    assert not any(c["text"].startswith("Data Protection and Retention Regulation") for c in clauses)  # heading
+
+
+def test_coverage_with_no_findings_and_bad_bodies():
+    ok = client.post("/api/coverage", json={"text": REGULATION, "anomalies": []})
+    assert ok.status_code == 200 and all(c["status"] == "not_flagged" for c in ok.json()["coverage"])
+    for body in ({"anomalies": []}, {"text": REGULATION}, {"text": "", "anomalies": []},
+                 {"text": "x" * 100_001, "anomalies": []}, {"text": REGULATION, "anomalies": "nope"}):
+        assert client.post("/api/coverage", json=body).status_code == 422
+    blank = client.post("/api/coverage", json={"text": "   ", "anomalies": []})
+    assert blank.status_code == 422 and blank.json()["detail"]["error"] == "INVALID_INPUT"
+
+
 # --------------------------------------------------------------------------- offline demo mode
 
 

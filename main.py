@@ -23,10 +23,11 @@ from ai_engine import (
     LLMError,
     LLMSetupError,
     analyze_compliance_gap,
+    build_coverage,
     generate_audit_report as engine_audit_report,
 )
 from mock_db import get_compliance_state
-from models import AuditGenerationRequest, RegulationAnalysisRequest
+from models import AuditGenerationRequest, CoverageRequest, RegulationAnalysisRequest
 
 logger = logging.getLogger("api")
 
@@ -150,3 +151,14 @@ def generate_audit_report(request: AuditGenerationRequest, llm: dict = Depends(l
     report = _call_engine(engine_audit_report, anomalies, **llm)
     # "renderer" and "model" are additive: "llm" | "deterministic", and the model called (or null).
     return {"anomalies": anomalies, "markdown": report["markdown"], "renderer": report["renderer"], "model": report["model"]}
+
+
+@app.post("/api/coverage")
+def coverage(request: CoverageRequest):
+    """Clause-by-clause coverage of the regulation by the findings. Deterministic, no LLM.
+
+    Send the regulation `text` and the `anomalies` that /api/analyze-regulation returned for
+    it. Returns {"coverage": [{"id": "CL-001", "text": "...", "span": [start, end],
+    "status": "gap" | "needs_info" | "not_flagged", "finding_ids": ["ANOM-001", ...]}]}.
+    """
+    return {"coverage": _call_engine(build_coverage, request.text, request.anomalies)}

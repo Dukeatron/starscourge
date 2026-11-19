@@ -186,6 +186,7 @@ uvicorn main:app --reload          # http://127.0.0.1:8000/docs
 | GET | `/api/system-state` | none | the mock company profile (`mock_db.py`) |
 | POST | `/api/analyze-regulation` | `{"text": "...", "company_state": {...}?}` | list of anomalies |
 | POST | `/api/generate-audit` | `{"anomalies": [...]}` or `{"text": "...", "company_state": {...}?}` | `{"anomalies": [...], "markdown": "...", "renderer": "llm" \| "deterministic", "model": "..." \| null}` |
+| POST | `/api/coverage` | `{"text": "...", "anomalies": [...]}` | `{"coverage": [{"id", "text", "span", "status", "finding_ids"}]}`, deterministic, no LLM |
 
 - **Your own key:** send it in the optional `X-LLM-Api-Key` header. `X-LLM-Provider` and `X-LLM-Model` are optional too, and `GET /api/providers` lists the providers. The older `X-Anthropic-Api-Key` header still works.
 - `company_state` defaults to the mock profile.
@@ -223,4 +224,4 @@ markdown  = generate_audit_trail(anomalies, api_key=user_key)                   
 | `/api/generate-audit` | `renderer` | `"llm"` \| `"deterministic"` | Who wrote `markdown`: the model, or the deterministic renderer (no gaps, demo mode, or the model's log failed validation). |
 | `/api/generate-audit` | `model` | string \| `null` | The model called for this log (even if its output was rejected), or `null` when no model was called. |
 
-Headings (e.g. "Section 4.1 Data Retention.") and text addressed to an AI ("ignore all previous instructions") are never used as `nearest` candidates or coverage clauses. `ai_engine.build_coverage(regulation_text, anomalies)` returns clause-by-clause coverage: `[{"id": "CL-001", "text": "...", "span": [start, end], "status": "gap" | "needs_info" | "not_flagged", "finding_ids": ["ANOM-001", ...]}]`. Findings map to clauses through `excerpt_span`. It is not served yet, because `/api/analyze-regulation` returns a bare list and a top-level field can't be added to it without breaking clients.
+Headings (e.g. "Section 4.1 Data Retention.") and text addressed to an AI ("ignore all previous instructions") are never used as `nearest` candidates or coverage clauses. `ai_engine.build_coverage(regulation_text, anomalies)` returns clause-by-clause coverage: `[{"id": "CL-001", "text": "...", "span": [start, end], "status": "gap" | "needs_info" | "not_flagged", "finding_ids": ["ANOM-001", ...]}]`. Findings map to clauses through `excerpt_span`. `POST /api/coverage` serves it: send the regulation `text` and the `anomalies` returned for it. It is a separate endpoint because `/api/analyze-regulation` returns a bare list, so a top-level field couldn't be added there without breaking clients.
