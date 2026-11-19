@@ -285,4 +285,30 @@ def test_cors_allows_the_key_header():
         },
     )
     assert response.status_code == 200
-    assert response.headers["access-control-allow-origin"] == "*"
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def _preflight(origin):
+    return client.options(
+        "/api/analyze-regulation",
+        headers={"Origin": origin, "Access-Control-Request-Method": "POST",
+                 "Access-Control-Request-Headers": "x-llm-api-key,content-type"},
+    )
+
+
+@pytest.mark.parametrize("origin", ["http://127.0.0.1:8000", "http://localhost", "https://localhost:3000"])
+def test_cors_allows_local_origins(origin):
+    response = _preflight(origin)
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+
+
+@pytest.mark.parametrize(
+    "origin", ["https://evil.example", "http://localhost.evil.example", "http://127.0.0.1.evil.example:80", "null"]
+)
+def test_cors_rejects_other_origins(origin):
+    response = _preflight(origin)
+    assert response.status_code == 400
+    assert "access-control-allow-origin" not in response.headers
+    simple = client.get("/health", headers={"Origin": origin})
+    assert "access-control-allow-origin" not in simple.headers

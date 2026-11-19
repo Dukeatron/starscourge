@@ -9,6 +9,7 @@ config only, so callers cannot point the server at arbitrary hosts.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -31,9 +32,17 @@ logger = logging.getLogger("api")
 
 app = FastAPI(title="Compliance Copilot API")
 
+# The UI is served from this app (same origin, no CORS needed). Cross-origin access is
+# limited to local dev servers on any port, plus any origins listed in CORS_ALLOW_ORIGINS
+# (comma-separated), so an arbitrary website cannot drive this unauthenticated API from a
+# visitor's browser.
+LOCAL_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
+EXTRA_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=EXTRA_ORIGINS,
+    allow_origin_regex=LOCAL_ORIGIN_REGEX,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

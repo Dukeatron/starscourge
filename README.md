@@ -189,6 +189,7 @@ uvicorn main:app --reload          # http://127.0.0.1:8000/docs
 
 - **Your own key:** send it in the optional `X-LLM-Api-Key` header. `X-LLM-Provider` and `X-LLM-Model` are optional too, and `GET /api/providers` lists the providers. The older `X-Anthropic-Api-Key` header still works.
 - `company_state` defaults to the mock profile.
+- **CORS:** the UI is served from the API itself (same origin). Cross-origin calls are allowed only from `localhost`/`127.0.0.1` on any port, plus origins listed in `CORS_ALLOW_ORIGINS` (comma-separated). Pages opened from `file://` (origin `null`) are refused, so open the UI through `uvicorn` instead.
 - Errors return a `detail.error` code:
   - **422:** `INVALID_INPUT`, for bad input.
   - **401:** `LLM_AUTH`, when the key is missing or rejected.
