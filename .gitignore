@@ -36,3 +36,12 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 *.log
+
+# Demo recordings (large binaries stay out of git)
+demo/out/
+*.webm
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.m4a

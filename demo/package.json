@@ -1,0 +1,14 @@
+{
+  "name": "compliance-engine-demo-recorder",
+  "private": true,
+  "type": "module",
+  "description": "Drives the AI Compliance Engine UI through docs/DEMO.md at a watchable pace and records video.",
+  "scripts": {
+    "record": "node record.mjs",
+    "rehearse": "node record.mjs --mock",
+    "smoke": "node record.mjs --mock --fast --headless"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1"
+  }
+}
