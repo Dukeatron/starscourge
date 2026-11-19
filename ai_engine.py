@@ -1263,8 +1263,29 @@ def generate_audit_trail(
     fails validation twice, a deterministic renderer is used instead. `api_key`, `provider`
     and `model` select the user's own key and model (default: environment). Raises ValueError on
     bad input and LLMError if the provider cannot be reached. With AI_ENGINE_DEMO=1 the
-    deterministic renderer is used and no LLM is called.
+    deterministic renderer is used and no LLM is called. Raw HTML is never emitted: every
+    "<" is escaped, so untrusted regulation or company text cannot inject markup.
     """
+    return _escape_html(
+        _audit_markdown(anomalies, generated_at, api_key=api_key, provider=provider, model=model)
+    )
+
+
+def _escape_html(markdown: str) -> str:
+    """Neutralize raw HTML in the audit log; "&lt;" still renders as "<" in Markdown.
+
+    Escaping "<" is enough: without it no tag can open, and Markdown's own syntax (tables,
+    headings, "**", blockquote ">") does not need it. Applied after validation, so the
+    date and structure checks see the text as written.
+    """
+    return markdown.replace("<", "&lt;")
+
+
+def _audit_markdown(
+    anomalies: Any, generated_at: datetime | None, *, api_key: str | None, provider: str | None,
+    model: str | None,
+) -> str:
+    """generate_audit_trail before HTML escaping (LLM log, or a deterministic renderer)."""
     items = _normalize_audit_items(anomalies)
     _check_llm_args(api_key, provider, model)
     when = _resolve_generated_at(generated_at)

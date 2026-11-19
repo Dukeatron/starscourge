@@ -1044,6 +1044,36 @@ def test_dotenv_is_loaded_lazily_without_overriding(no_key, monkeypatch, tmp_pat
     assert os.environ["OPENAI_API_KEY"] == "from-env"
 
 
+# --------------------------------------------------------------------------- HTML escaping
+
+_XSS = '<img src=x onerror="alert(1)">'
+
+
+def test_fallback_audit_escapes_html_from_untrusted_fields(provider):
+    provider("not a valid log")  # forces the deterministic renderer
+    anoms = [{"id": "ANOM-001", **make_anomaly(
+        title="Retention " + _XSS, regulation_excerpt="records " + _XSS,
+        current_state="<script>x</script>", recommended_remediation="Fix <b>it</b>.",
+    )}]
+    md = generate_audit_trail(anoms, generated_at=GENERATED_AT)
+    assert "<" not in md
+    assert "&lt;img src=x onerror" in md and "&lt;script>" in md
+    assert md.startswith("# Compliance Audit Log") and "### ANOM-001" in md
+
+
+def test_llm_written_audit_is_escaped_too(provider):
+    anoms = anomalies_with_ids()
+    md_in = good_markdown(anoms).replace("## 4. Audit Trail", _XSS + "\n\n## 4. Audit Trail")
+    provider(md_in)
+    md = generate_audit_trail(anoms, generated_at=GENERATED_AT)
+    assert "<img" not in md and "&lt;img" in md
+
+
+def test_no_gaps_log_has_no_raw_html(provider):
+    provider("unused")
+    assert "<" not in generate_audit_trail([], generated_at=GENERATED_AT)
+
+
 # --------------------------------------------------------------------------- offline demo mode
 
 
